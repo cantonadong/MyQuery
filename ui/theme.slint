@@ -1,0 +1,39 @@
+import { Palette } from "std-widgets.slint";
+
+export global Theme {
+    in-out property <bool> dark: false;
+    changed dark => { Palette.color-scheme = self.dark ? ColorScheme.dark : ColorScheme.light; }
+    out property <color> window: dark ? #171c24 : #f3f5f8;
+    out property <color> surface: dark ? #1e2430 : white;
+    out property <color> panel: dark ? #202735 : #edf1f6;
+    out property <color> hover: dark ? #2a3546 : #e4ebf5;
+    out property <color> alternate: dark ? #242d3a : #f7f9fc;
+    out property <color> selected: dark ? #314c70 : #dce7f5;
+    out property <color> text: dark ? #dce6f3 : #243447;
+    out property <color> muted: dark ? #a4b3c7 : #536277;
+    out property <color> heading: dark ? #b1cfff : #203c63;
+    out property <color> border: dark ? #465268 : #bfc8d4;
+    out property <color> table-border: dark ? #465268 : #cbd5e1;
+    out property <color> selected-border: dark ? #709bd1 : #779cca;
+    out property <color> focus: dark ? #8cbbff : #3c72b5;
+    out property <color> divider: dark ? #364153 : #d7dee8;
+    out property <color> divider-hover: dark ? #719bcf : #80a4cf;
+    out property <color> status: dark ? #202b3c : #eaf0f8;
+    out property <color> error-background: dark ? #3f262c : #fff0ef;
+    out property <color> negative: dark ? #ff8585 : #c62828;
+    out property <color> editor-selection: dark ? #39465a : #d9e8fa;
+    out property <color> search-match: #ffda45;
+    out property <color> search-match-text: #1b2028;
+    out property <color> selection: dark ? #3a618f : #376fac;
+    out property <color> toast-background: dark ? #314c70 : #203c63;
+
+    public pure function syntax-color(original: color) -> color {
+        if !self.dark { return original; }
+        if original == #245dc1 { return #82b1ff; }
+        if original == #238047 { return #8fd6a2; }
+        if original == #94651c { return #e4c07a; }
+        if original == #8554a5 { return #cba6f7; }
+        if original == #738276 { return #99aa9d; }
+        return self.text;
+    }
+}

@@ -1,0 +1,158 @@
+import { ScrollView, LineEdit, HorizontalBox } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+export struct SearchMatch { start: int, end: int, count: int, ordinal: int }
+
+export struct SqlRun { text: string, color: color, source: string, offset: int }
+
+component FindButton inherits Rectangle {
+    in property <string> text;
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 28px; height: 24px; horizontal-stretch: 0; vertical-stretch: 0;
+    border-radius: 4px; border-width: 1px;
+    border-color: focus.has-focus ? Theme.focus : Theme.border;
+    background: touch.has-hover && root.enabled ? Theme.hover : Theme.surface;
+    accessible-role: button; accessible-label: root.label; accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    Text { width: 100%; height: 100%; text: root.text; font-size: 12px; color: Theme.text; opacity: root.enabled ? 1 : 0.4; horizontal-alignment: center; vertical-alignment: center; }
+    focus := FocusScope {
+        width: 100%; height: 100%; enabled: root.enabled;
+        key-pressed(event) => { if event.text == Key.Return || event.text == Key.Space { root.clicked(); return accept; } return reject; }
+        touch := TouchArea { clicked => { focus.focus(); root.clicked(); } }
+    }
+}
+
+export component SqlEditor inherits Rectangle {
+    in-out property <string> text;
+    in property <bool> read-only;
+    in property <bool> zh;
+    in property <[[SqlRun]]> lines;
+    in property <string> highlighted-source;
+    callback highlight(string);
+    callback save();
+    callback find(string, int, bool) -> SearchMatch;
+    private property <bool> find-open;
+    private property <string> needle;
+    private property <SearchMatch> found: { start: -1, end: -1, count: 0, ordinal: 0 };
+    public function open-find() {
+        root.find-open = true;
+        search-input.focus();
+    }
+    function find-next(backward: bool) {
+        root.found = root.find(root.needle, root.found.start, backward);
+        if root.found.start >= 0 { input.set-selection-offsets(root.found.start, root.found.end); }
+    }
+    function refresh-find() {
+        root.found = { start: -1, end: -1, count: 0, ordinal: 0 };
+        if root.find-open { root.find-next(false); }
+    }
+    function close-find() { root.find-open = false; input.focus(); }
+    private property <bool> colored: root.text == root.highlighted-source && root.lines.length > 0 && input.preedit-text == "";
+    private property <length> line-height: metric.preferred-height / 2;
+    private property <Point> cursor;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.focus : Theme.border;
+    border-radius: 4px;
+    forward-focus: input;
+    changed text => { root.refresh-find(); root.highlight(root.text); metric.set-selection-offsets(3, 3); }
+    init => { root.highlight(root.text); metric.set-selection-offsets(3, 3); }
+    metric := TextInput {
+        visible: false; text: "Mg\nMg"; single-line: false; wrap: no-wrap; font-family: "Consolas"; font-size: 13px;
+        cursor-position-changed(pos) => { if pos.y > 0px { root.line-height = pos.y; } }
+    }
+    ContextMenuArea {
+        x: 5px; y: 5px; width: parent.width - 10px; height: parent.height - self.y - 5px;
+        Menu {
+            MenuItem { title: root.zh ? "剪切" : "Cut"; enabled: !root.read-only; activated => { input.cut(); } }
+            MenuItem { title: root.zh ? "复制" : "Copy"; activated => { input.copy(); } }
+            MenuItem { title: root.zh ? "粘贴" : "Paste"; enabled: !root.read-only; activated => { input.paste(); } }
+            MenuItem { title: root.zh ? "全选" : "Select all"; activated => { input.select-all(); } }
+        }
+        scroll := ScrollView {
+            content-width: max(self.visible-width, input.preferred-width + 4px);
+            content-height: max(self.visible-height, input.preferred-height);
+            for line[index] in root.lines: Rectangle {
+                visible: root.colored;
+                x: 0px; y: index * root.line-height;
+                width: scroll.content-width; height: root.line-height;
+                clip: true;
+                for run in line: Rectangle {
+                    private property <length> run-x;
+                    width: parent.width; height: parent.height;
+                    prefix-metric := TextInput {
+                        visible: false;
+                        text: run.source;
+                        single-line: false; wrap: no-wrap;
+                        font-family: "Consolas"; font-size: 13px;
+                        init => { self.set-selection-offsets(run.offset, run.offset); }
+                        changed text => { self.set-selection-offsets(run.offset, run.offset); }
+                        cursor-position-changed(pos) => { parent.run-x = pos.x; }
+                    }
+                    Text {
+                        x: parent.run-x;
+                        text: run.text; color: Theme.syntax-color(run.color);
+                        font-family: "Consolas"; font-size: 13px;
+                        wrap: no-wrap; vertical-alignment: top;
+                    }
+                }
+            }
+            input := TextInput {
+                x: 0px; y: 0px;
+                text <=> root.text;
+                single-line: false;
+                read-only: root.read-only;
+                wrap: no-wrap;
+                font-family: "Consolas";
+                font-size: 13px;
+                color: root.colored ? transparent : Theme.text;
+                selection-background-color: root.find-open && root.found.start >= 0 ? Theme.search-match : Theme.editor-selection;
+                selection-foreground-color: root.find-open && root.found.start >= 0 ? Theme.search-match-text : Theme.text;
+                page-height: scroll.visible-height;
+                edited => { root.highlight(root.text); }
+                key-pressed(event) => {
+                    if event.modifiers.control && (event.text == "s" || event.text == "S") { root.save(); return accept; }
+                    if event.modifiers.control && (event.text == "f" || event.text == "F") { root.open-find(); return accept; }
+                    if event.text == Key.Escape && root.find-open { root.close-find(); return accept; }
+                    return reject;
+                }
+                cursor-position-changed(pos) => {
+                    root.cursor = pos;
+                    if pos.x + scroll.content-x < 0px { scroll.content-x = -pos.x; }
+                    if pos.x + scroll.content-x > scroll.visible-width - 4px { scroll.content-x = min(0px, scroll.visible-width - pos.x - 4px); }
+                    if pos.y + scroll.content-y < 0px { scroll.content-y = -pos.y; }
+                    if pos.y + scroll.content-y > scroll.visible-height - root.line-height { scroll.content-y = min(0px, scroll.visible-height - pos.y - root.line-height); }
+                }
+            }
+            Rectangle { x: root.cursor.x; y: root.cursor.y; width: 1px; height: root.line-height; background: Theme.text; visible: root.colored && input.has-focus && !root.read-only && input.cursor-position-byte-offset == input.anchor-position-byte-offset; }
+        }
+    }
+    Rectangle {
+        visible: root.find-open;
+        x: parent.width - self.width - 6px; y: 6px;
+        width: min(420px, parent.width - 12px); height: 44px;
+        background: Theme.panel; border-width: 1px; border-color: Theme.border; border-radius: 4px;
+        TouchArea {}
+        HorizontalBox { padding: 6px; spacing: 4px;
+        search-input := LineEdit {
+            height: 32px;
+            text <=> root.needle;
+            placeholder-text: root.zh ? "查找 SQL" : "Find in SQL";
+            edited => { root.refresh-find(); }
+            accepted => { root.find-next(false); }
+            key-pressed(event) => {
+                if event.text == Key.Escape { root.close-find(); return accept; }
+                if event.text == Key.Return && event.modifiers.shift { root.find-next(true); return accept; }
+                return reject;
+            }
+        }
+        Text { text: root.found.ordinal + " / " + root.found.count; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
+        Rectangle { width: 28px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "↑"; label: root.zh ? "上一处" : "Previous match"; enabled: root.found.count > 0; clicked => { root.find-next(true); } } }
+        Rectangle { width: 28px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "↓"; label: root.zh ? "下一处" : "Next match"; enabled: root.found.count > 0; clicked => { root.find-next(false); } } }
+        Rectangle { width: 28px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "×"; label: root.zh ? "关闭查找" : "Close find"; clicked => { root.close-find(); } } }
+    }
+    }
+
+}
