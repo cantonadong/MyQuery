@@ -1,5 +1,7 @@
 /target/
 /SqlDesk.exe
+/MyQuery.exe
 /passwords.dat
 /passwords.lock
 /SqlDesk.exe.lnk
+/MyQuery.exe.lnk

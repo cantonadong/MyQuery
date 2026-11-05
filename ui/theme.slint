@@ -1,6 +1,12 @@
 import { Palette } from "std-widgets.slint";
 
 export global Theme {
+    out property <length> control-gap: 4px;
+    out property <length> control-radius: 3px;
+    out property <length> inline-button-size: 18px;
+    out property <color> destructive: #c62828;
+    out property <length> popup-row-height: 28px;
+    out property <length> popup-padding: 4px;
     in-out property <bool> dark: false;
     changed dark => { Palette.color-scheme = self.dark ? ColorScheme.dark : ColorScheme.light; }
     out property <color> window: dark ? #171c24 : #f3f5f8;

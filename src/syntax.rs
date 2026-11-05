@@ -116,6 +116,7 @@ pub fn highlight(sql: &str) -> Vec<Vec<crate::SqlRun>> {
                     text: part.into(),
                     color: slint::Color::from_argb_encoded(0xff000000 | rgb),
                     offset,
+                    end: offset + part.len() as i32,
                     source: Default::default(),
                 });
             }

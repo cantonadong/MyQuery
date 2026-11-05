@@ -36,6 +36,9 @@ fn number_key(value: &str) -> Option<(i8, i64, String)> {
 }
 
 pub struct ResultSet {
+    pub repeats: usize,
+    pub status: bool,
+    pub exported: bool,
     pub headers: Vec<String>,
     pub count: usize,
     file: File,
@@ -49,6 +52,9 @@ impl ResultSet {
         let file = tempfile::tempfile().map_err(|e| e.to_string())?;
         let writer = BufWriter::new(file.try_clone().map_err(|e| e.to_string())?);
         Ok(Self {
+            repeats: 1,
+            status: false,
+            exported: false,
             headers,
             count: 0,
             file,
@@ -82,6 +88,22 @@ impl ResultSet {
         self.writer.flush().map_err(|e| e.to_string())
     }
 
+    pub fn same_content(&mut self, other: &mut Self) -> Result<bool, String> {
+        if self.headers != other.headers || self.count != other.count || self.bytes != other.bytes { return Ok(false); }
+        self.finish()?;
+        other.finish()?;
+        self.file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        other.file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        let mut left = [0; 8192];
+        let mut right = [0; 8192];
+        loop {
+            let count = self.file.read(&mut left).map_err(|e| e.to_string())?;
+            other.file.read_exact(&mut right[..count]).map_err(|e| e.to_string())?;
+            if left[..count] != right[..count] { return Ok(false); }
+            if count == 0 { return Ok(true); }
+        }
+    }
+
     pub fn sort(&mut self, column: usize, descending: bool, cancelled: impl Fn() -> bool) -> Result<(), String> {
         if column >= self.headers.len() { return Err("Invalid column".into()); }
         self.finish()?;
@@ -107,6 +129,9 @@ impl ResultSet {
         });
         if descending { entries.reverse(); }
         let mut sorted = Self::new(self.headers.clone())?;
+        sorted.repeats = self.repeats;
+        sorted.status = self.status;
+        sorted.exported = self.exported;
         let mut buffer = Vec::new();
         for (_, offset, length) in entries {
             if cancelled() { return Err("CANCELLED".into()); }
@@ -182,7 +207,7 @@ impl ResultSet {
             let row: Cells = serde_json::from_str(&line.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
             writer.write_record(columns.iter().map(|column| {
                 if cells.as_ref().is_some_and(|cells| !cells.contains(&(index, *column))) { "" }
-                else { row[*column].as_deref().unwrap_or("\\N") }
+                else { row[*column].as_deref().unwrap_or("NULL") }
             })).map_err(|e| e.to_string())?;
             if writer.get_ref().len() > 8 * 1024 * 1024 { return Err("LIMIT_COPY".into()); }
         }
@@ -262,6 +287,7 @@ mod tests {
         assert_eq!(rows.len(), 201);
         assert_eq!(&rows[200][0], "200,中\n文");
         assert_eq!(&rows[200][1], "NULL");
+        assert!(set.clipboard(Some(2), None, None, false, || false).unwrap().contains("\tNULL"));
         let original = std::fs::read(&path).unwrap();
         assert!(set.export(&path, || true).is_err());
         assert_eq!(std::fs::read(path).unwrap(), original);

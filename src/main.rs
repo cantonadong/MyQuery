@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod cache;
+mod completion;
 mod config;
 mod db;
 mod documents;
@@ -59,6 +60,11 @@ fn update_result(ui: &slint::Weak<AppWindow>, id: i32, f: impl FnOnce(&AppWindow
     });
 }
 fn clear_results(ui: &AppWindow) {
+    ui.set_query_error("".into());
+    ui.set_query_running(false);
+    ui.set_query_has_run(false);
+    ui.set_query_elapsed(0.0);
+    ui.set_result_status(false);
     ui.set_result_names(ModelRc::default());
     ui.set_result_columns(ModelRc::default());
     ui.set_result_rows(ModelRc::default());
@@ -72,6 +78,17 @@ fn clear_results(ui: &AppWindow) {
     ui.set_row_count("0".into());
     ui.set_page(0);
     ui.set_pages(0);
+}
+fn localize_result(ui: &AppWindow) {
+    if !ui.get_result_status() { return; }
+    let zh = ui.global::<I18n>().get_zh();
+    let columns = ui.get_result_columns();
+    for (index, title) in [tr(zh, "状态", "Status"), tr(zh, "影响行数", "Affected rows")].into_iter().enumerate() {
+        if let Some(mut column) = columns.row_data(index) { column.title = title.into(); columns.set_row_data(index, column); }
+    }
+    for row in ui.get_result_rows().iter() {
+        if let Some(mut cell) = row.row_data(0) { cell.text = tr(zh, "执行成功", "Success").into(); row.set_row_data(0, cell); }
+    }
 }
 fn loading_fields(ui: &AppWindow, name: &str) {
     ui.set_field_panel_hidden(false);
@@ -129,10 +146,11 @@ fn filter_objects(ui: &AppWindow) {
     let mut counts = [0; 3];
     let mut names = Vec::new();
     let objects = if show_hidden { ui.get_hidden_objects() } else { ui.get_objects() };
+    let columns: Vec<(String, Vec<String>)> = ui.get_column_index().iter().filter_map(|entry| serde_json::from_str(entry.as_str()).ok()).collect();
     for object in objects.iter() {
         let kind = object.kind as usize;
         let name = object.name.to_lowercase();
-        if kind < 3 && name.contains(&search) && (show_hidden || name.starts_with(&prefix))
+        if kind < 3 && (name.contains(&search) || columns.iter().any(|(table, fields)| table == object.name.as_str() && fields.iter().any(|field| field.to_lowercase().contains(&search)))) && (show_hidden || name.starts_with(&prefix))
             && (show_hidden || !hidden.contains(&(object.name.clone(), object.kind))) {
             counts[kind] += 1;
             if object.kind == ui.get_object_kind() {
@@ -197,6 +215,11 @@ enum Command {
     Tables(String),
     Fields(String, String, String),
     Refresh,
+    RefreshSchema,
+    Reconnect,
+    Cancel(i32),
+    CloseDocument(i32),
+    CloseResult(usize, usize),
     Run(String, u64),
     Page(usize, usize),
     Sort(usize, usize, bool),
@@ -227,6 +250,7 @@ struct Worker {
     settings_error: Option<String>,
     current_schema: String,
     metadata_cache: cache::MetadataCache,
+    query_only: bool,
 }
 
 async fn guarded<T, E: From<&'static str>>(
@@ -283,6 +307,11 @@ impl Worker {
         });
     }
     fn disconnect(&mut self) {
+        if self.query_only {
+            self.session = None;
+            self.session_profile = None;
+            return;
+        }
         self.session = None;
         self.session_profile = None;
         self.active = None;
@@ -297,6 +326,7 @@ impl Worker {
             ui.set_schema_index(-1);
             ui.set_tables(ModelRc::default());
             ui.set_objects(ModelRc::default());
+            ui.set_column_index(ModelRc::default());
             ui.set_hidden_objects(ModelRc::default());
             ui.set_show_hidden(false);
             ui.set_table_count(0);
@@ -401,6 +431,7 @@ impl Worker {
             }
         }
         self.active = Some((profile.clone(), password));
+        self.ensure_session().await?;
         self.sync_prefixes();
         let label = format!("{} @ {} / {}", profile.user, profile.host, profile.database);
         let physical_index = self
@@ -499,8 +530,10 @@ impl Worker {
             });
         }
         let objects = if schema.is_empty() { Vec::new() } else { self.load_objects(schema).await? };
+        let columns = self.active.as_ref().map(|(profile, _)| objects.iter().map(|object| serde_json::to_string(&(object.name.as_str(), self.metadata_cache.columns(profile, schema, &object.name))).unwrap()).collect()).unwrap_or_default();
         let changed = self.active.as_ref().map(|(profile, _)| self.metadata_cache.changed_tables(profile, schema, &objects)).unwrap_or_default();
         update(&self.ui, move |ui| {
+            ui.set_column_index(strings(columns));
             ui.set_changed_tables(strings(changed));
             ui.set_table_index(-1);
             ui.set_fields(ModelRc::default());
@@ -606,10 +639,15 @@ impl Worker {
         let set = self.sets.get_mut(index).ok_or("No result set")?;
         let pages = set.count.div_ceil(PAGE_SIZE);
         let page = page.min(pages.saturating_sub(1));
-        let rows = set.page(page, true, None)?;
+        let mut rows = set.page(page, true, None)?;
         let count = set.count.to_string();
-        let headers = set.headers.clone();
+        let status = set.status;
+        let headers = if set.status {
+            for row in &mut rows { row[0] = Some(tr(self.zh, "执行成功", "Success")); }
+            vec![tr(self.zh, "状态", "Status"), tr(self.zh, "影响行数", "Affected rows")]
+        } else { set.headers.clone() };
         update_result(&self.ui, self.result_tab, move |ui| {
+            ui.set_result_status(status);
             let columns: Vec<TableColumn> = headers
                 .into_iter()
                 .map(|title| {
@@ -658,6 +696,46 @@ impl Worker {
             }
         }
         match command {
+            Command::Cancel(_) | Command::CloseDocument(_) => Ok(String::new()),
+            Command::Reconnect => {
+                if self.active.is_some() {
+                    self.session = None;
+                    self.session_profile = None;
+                    self.ensure_session().await?;
+                    Ok(self.message("连接成功", "Connected"))
+                } else {
+                    let index = self.settings.last_selection.as_ref().and_then(|last| self.settings.profiles.iter().position(|profile| profile.name == last.profile)).ok_or_else(|| self.message("请先选择连接", "Select a connection first"))?;
+                    let profile = self.settings.profiles[index].clone();
+                    let password = config::password(&profile.name)?;
+                    self.connect(profile, password).await?;
+                    self.ensure_session().await?;
+                    Ok(self.message("连接成功", "Connected"))
+                }
+            }
+            Command::CloseResult(index, active) => {
+                if self.sets.get(index).is_some_and(|set| !set.exported && set.count > 0) {
+                    let zh = self.zh;
+                    let confirmed = tokio::task::spawn_blocking(move || rfd::MessageDialog::new()
+                        .set_title(tr(zh, "关闭结果", "Close result"))
+                        .set_description(tr(zh, "此结果尚未导出，确定关闭？", "This result has not been exported. Close it?"))
+                        .set_buttons(rfd::MessageButtons::YesNo).show()).await.map_err(|error| error.to_string())?;
+                    if confirmed != rfd::MessageDialogResult::Yes { return Ok(String::new()); }
+                }
+                if index < self.sets.len() { self.sets.remove(index); }
+                let names = self.sets.iter().enumerate().map(|(i, set)| if set.repeats > 1 { format!("{} × {}", i + 1, set.repeats) } else { (i + 1).to_string() }).collect();
+                update_result(&self.ui, self.result_tab, move |ui| {
+                    let elapsed = ui.get_query_elapsed();
+                    let phase = ui.get_query_phase();
+                    let has_run = ui.get_query_has_run();
+                    clear_results(ui);
+                    ui.set_query_elapsed(elapsed);
+                    ui.set_query_phase(phase);
+                    ui.set_query_has_run(has_run);
+                    ui.set_result_names(strings(names));
+                });
+                if !self.sets.is_empty() { self.page((if index < active { active - 1 } else { active }).min(self.sets.len() - 1), 0)?; }
+                Ok(String::new())
+            }
             Command::ScopeChoices(level, profiles, previous_databases, previous_schemas) => {
                 let mut databases = Vec::new();
                 if level == 0 {
@@ -806,6 +884,15 @@ impl Worker {
                 self.disconnect();
                 Ok(self.message("已断开连接", "Disconnected"))
             }
+            Command::RefreshSchema => {
+                let profile = self.active.as_ref().ok_or_else(|| self.message("请先连接数据库", "Connect first"))?.0.clone();
+                let schema = self.current_schema.clone();
+                if schema.is_empty() { return Err(self.message("请先选择模式", "Select a schema first")); }
+                self.metadata_cache.invalidate_scope(&profile, &schema);
+                self.metadata(&db::columns_sql(&schema, None, profile.redshift)).await?;
+                self.tables(&schema).await?;
+                Ok(self.message("当前模式的表、字段和类型已刷新", "Tables, columns and types refreshed for the current schema"))
+            }
             Command::Refresh => {
                 let original = self.active.clone().ok_or("No connection")?;
                 let schema = self.current_schema.clone();
@@ -844,21 +931,11 @@ impl Worker {
                     .active
                     .as_ref()
                     .is_some_and(|(profile, _)| profile.redshift);
-                let sql = if redshift {
-                    format!(
-                        "SELECT column_name, CASE WHEN LOWER(data_type) IN ('character varying', 'varchar', 'nvarchar', 'character', 'char', 'nchar', 'bpchar') AND character_maximum_length IS NOT NULL THEN CASE WHEN LOWER(data_type) IN ('character varying', 'varchar', 'nvarchar') THEN 'varchar' ELSE 'char' END || '(' || CAST(character_maximum_length AS VARCHAR(20)) || ')' WHEN LOWER(data_type) IN ('numeric', 'decimal') AND numeric_precision IS NOT NULL AND numeric_scale IS NOT NULL THEN data_type || '(' || CAST(numeric_precision AS VARCHAR(20)) || ',' || CAST(numeric_scale AS VARCHAR(20)) || ')' ELSE data_type END, is_nullable, column_default, CASE LOWER(data_type) WHEN 'smallint' THEN 2 WHEN 'int2' THEN 2 WHEN 'integer' THEN 4 WHEN 'int' THEN 4 WHEN 'int4' THEN 4 WHEN 'bigint' THEN 8 WHEN 'int8' THEN 8 WHEN 'real' THEN 4 WHEN 'float4' THEN 4 WHEN 'double precision' THEN 8 WHEN 'float8' THEN 8 WHEN 'float' THEN 8 WHEN 'boolean' THEN 1 WHEN 'bool' THEN 1 WHEN 'date' THEN 4 WHEN 'time' THEN 8 WHEN 'time without time zone' THEN 8 WHEN 'timetz' THEN 8 WHEN 'time with time zone' THEN 8 ELSE NULL END FROM svv_all_columns WHERE database_name = current_database() AND schema_name = {} AND table_name = {} ORDER BY ordinal_position",
-                        db::literal(&schema, true),
-                        db::literal(&table, true)
-                    )
-                } else {
-                    format!(
-                        "SELECT a.attname, pg_catalog.format_type(a.atttypid,a.atttypmod), CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END, pg_catalog.pg_get_expr(d.adbin,d.adrelid), t.typlen FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid=a.atttypid JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE n.nspname={} AND c.relname={} AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum",
-                        db::literal(&schema, false),
-                        db::literal(&table, false)
-                    )
-                };
-                let mut rows = self.metadata(&sql).await?;
-                let added = self.active.as_ref().map(|(profile, _)| self.metadata_cache.changed_columns(profile, &sql, &rows)).unwrap_or_default();
+                let sql = db::columns_sql(&schema, Some(&table), redshift);
+                let cached = self.active.as_ref().and_then(|(profile, _)| self.metadata_cache.schema_columns(profile, &schema, &table));
+                let from_schema = cached.is_some();
+                let mut rows = match cached { Some(rows) => rows, None => self.metadata(&sql).await? };
+                let added = self.active.as_ref().map(|(profile, _)| if from_schema { self.metadata_cache.changed_schema_columns(profile, &schema, &table, &rows) } else { self.metadata_cache.changed_columns(profile, &sql, &rows) }).unwrap_or_default();
                 let objects = vec![DbObject { name: table.as_str().into(), kind: 0 }];
                 let table_changed = self.active.as_ref().is_some_and(|(profile, _)| !self.metadata_cache.changed_tables(profile, &schema, &objects).is_empty());
                 for row in &mut rows {
@@ -901,6 +978,12 @@ impl Worker {
                 let title = format!("{schema}.{table}");
                 update(&self.ui, move |ui| {
                     use slint::Model;
+                    if ui.get_schema() != schema.as_str() { return; }
+                    let mut index: Vec<String> = ui.get_column_index().iter().map(|entry| entry.to_string()).filter(|entry| serde_json::from_str::<(String, Vec<String>)>(entry).is_ok_and(|(name, _)| name != table)).collect();
+                    index.push(serde_json::to_string(&(&table, &field_names)).unwrap());
+                    ui.set_column_index(strings(index));
+                    ui.set_completion_revision(ui.get_completion_revision() + 1);
+                    if action == "completion" { filter_objects(&ui); return; }
                     if action.is_empty()
                         && (ui.get_schema() != schema.as_str()
                             || ui
@@ -966,20 +1049,18 @@ impl Worker {
                     }
                 }
                 self.sets.clear();
-                update_result(&self.ui, self.result_tab, |ui| clear_results(&ui));
                 let session = self
                     .session
                     .as_ref()
                     .ok_or_else(|| self.message("请先连接数据库", "Connect first"))?;
-                update(&self.ui, |ui| ui.set_query_phase(tr(ui.global::<I18n>().get_zh(), "执行 SQL", "Executing SQL").into()));
+                update_result(&self.ui, self.result_tab, |ui| ui.set_query_phase(1));
                 let progress_ui = self.ui.clone();
-                let progress_phase = self.message("读取结果", "Receiving results");
+                let document_id = self.result_tab;
                 let result = guarded(
-                    db::execute(&session.client, &sql, self.zh, move |rows| {
-                        let phase = progress_phase.clone();
-                        update(&progress_ui, move |ui| {
+                    db::execute(&session.client, &sql, move |rows| {
+                        update_result(&progress_ui, document_id, move |ui| {
                             ui.set_query_rows(rows.to_string().into());
-                            ui.set_query_phase(phase.into());
+                            ui.set_query_phase(2);
                         });
                     }),
                     self.cancelled.clone(),
@@ -1012,8 +1093,8 @@ impl Worker {
                     }
                 };
                 self.sets = sets;
-                let names = (0..self.sets.len())
-                    .map(|i| format!("{} {}", self.message("结果", "Result"), i + 1))
+                let names = self.sets.iter().enumerate()
+                    .map(|(i, set)| if set.repeats > 1 { format!("{} × {}", i + 1, set.repeats) } else { (i + 1).to_string() })
                     .collect();
                 update_result(&self.ui, self.result_tab, move |ui| ui.set_result_names(strings(names)));
                 if !self.sets.is_empty() {
@@ -1058,6 +1139,7 @@ impl Worker {
                         .get_mut(index)
                         .ok_or("No result set")?
                         .export(&path, || cancelled.load(Ordering::Relaxed))?;
+                    self.sets[index].exported = true;
                     Ok(format!(
                         "{}: {}",
                         self.message("导出成功", "Exported"),
@@ -1297,7 +1379,7 @@ impl Worker {
                 let old = self.settings.query_timeout;
                 self.settings.query_timeout = Some(timeout);
                 if let Err(error) = config::save(&self.settings) { self.settings.query_timeout = old; return Err(error); }
-                update(&self.ui, move |ui| { ui.set_timeout(timeout as i32); ui.set_timeout_open(false); });
+                update(&self.ui, move |ui| { ui.set_timeout((timeout / 60) as i32); ui.set_timeout_open(false); });
                 Ok(self.message("已保存", "Saved"))
             }
             Command::Language(zh) => {
@@ -1319,6 +1401,9 @@ fn save_sql(path: &Path, sql: &str) -> Result<(), String> {
 }
 
 fn explain(zh: bool, error: String) -> String {
+    if let Some((message, context)) = error.rsplit_once("\nCurrent database / schema: ") {
+        return format!("{message}\n{}: {context}", tr(zh, "当前数据库 / 模式", "Current database / schema"));
+    }
     match error.as_str() {
         "PASSWORDS_BUSY" => tr(
             zh,
@@ -1370,16 +1455,20 @@ fn submit(
     cancelled: &AtomicBool,
     command: Command,
 ) {
-    if ui.get_busy() {
+    let query = matches!(&command, Command::Run(..));
+    let cancel_request = matches!(&command, Command::Cancel(..));
+    if (ui.get_busy() && !cancel_request) || (query && ui.get_query_running()) ||
+        (ui.get_queries_running() && matches!(&command, Command::Connect(..) | Command::UseProfile(..) | Command::SwitchDatabase(..) | Command::Disconnect | Command::Tables(..) | Command::SaveScopes(..) | Command::Refresh | Command::RefreshSchema)) {
         return;
     }
     let zh = ui.global::<I18n>().get_zh();
     cancelled.store(false, Ordering::Relaxed);
-    let query = matches!(&command, Command::Run(..));
+    let browser_refresh = match &command { Command::Refresh => 1, Command::RefreshSchema => 2, _ => 0 };
     match tx.try_send(Request { command, zh, started: Instant::now(), document_id: ui.get_active_document(), open_documents: ui.get_sql_tabs().iter().map(|tab| tab.id).collect() }) {
         Ok(()) => {
-            if query { ui.set_query_document(ui.get_active_document()); ui.invoke_query_started(); }
-            ui.set_busy(true);
+            if query { clear_results(ui); ui.invoke_query_started(); ui.invoke_query_state_changed(ui.get_active_document(), true); }
+            if !query && !cancel_request { ui.set_busy(true); }
+            if browser_refresh != 0 { ui.set_browser_refresh(browser_refresh); }
             ui.set_failed(false);
             ui.set_status("".into());
         }
@@ -1398,7 +1487,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => (Settings::default(), Some(e)),
     };
     let saved_maximized = settings.maximized;
-    ui.set_timeout(settings.query_timeout.unwrap_or(120).clamp(1, 3600) as i32);
+    ui.set_timeout(settings.query_timeout.unwrap_or(3600).div_ceil(60).clamp(1, 3600) as i32);
     let zh = settings
         .language
         .as_deref()
@@ -1409,6 +1498,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .starts_with("zh")
         });
     ui.global::<I18n>().set_zh(zh);
+    ui.invoke_sync_language_menu();
     ui.global::<Theme>().set_dark(settings.dark_theme);
     ui.invoke_sync_theme_menu();
     ui.set_profiles(strings(
@@ -1443,10 +1533,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.window().on_close_requested(move || {
         if let Some(ui) = weak.upgrade() {
             if ui.get_document_saving() {
-                ui.invoke_notify(tr(ui.global::<I18n>().get_zh(), "请先完成或取消保存", "Finish or cancel the save first").into());
+                ui.set_failed(true);
+                ui.set_status(tr(ui.global::<I18n>().get_zh(), "请先完成或取消保存", "Finish or cancel the save first").into());
                 return slint::CloseRequestResponse::KeepWindowShown;
             }
-            if ui.get_busy() {
+            if ui.get_busy() || ui.get_sql_tabs().iter().any(|tab| tab.running) {
                 close_pending.store(true, Ordering::Relaxed);
                 close_cancel.store(true, Ordering::Relaxed);
                 ui.set_status(
@@ -1465,7 +1556,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         slint::CloseRequestResponse::KeepWindowShown
     });
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Request>(1);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Request>(64);
     let weak = ui.as_weak();
     let cancel = cancelled.clone();
     let worker = std::thread::Builder::new()
@@ -1481,6 +1572,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ui.set_failed(true);
                         ui.set_status(e.to_string().into());
                         ui.set_busy(false);
+                        ui.set_browser_refresh(0);
                     });
                     return;
                 }
@@ -1500,8 +1592,105 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     settings_error: error,
                     current_schema: String::new(),
                     metadata_cache: cache::MetadataCache::load(),
+                    query_only: false,
                 };
-                while let Some(request) = rx.recv().await {
+                let mut queries = tokio::task::JoinSet::<(i32, Worker, Result<String, String>, Instant)>::new();
+                let mut sessions = std::collections::HashMap::new();
+                let mut cancellations = std::collections::HashMap::<i32, Arc<AtomicBool>>::new();
+                let mut open_documents = std::collections::HashSet::new();
+                let mut heartbeat = tokio::time::interval(Duration::from_millis(250));
+                let mut reconnects = tokio::task::JoinSet::new();
+                let mut last_reconnect = Instant::now();
+                loop {
+                    let request = tokio::select! {
+                        request = rx.recv() => { let Some(request) = request else { break; }; request },
+                        completed = queries.join_next(), if !queries.is_empty() => {
+                            if let Some(Ok((id, mut query, result, started))) = completed {
+                                cancellations.remove(&id);
+                                if !open_documents.contains(&id) { continue; }
+                                sessions.insert(id, (query.session.take(), query.session_profile.take()));
+                                if worker.result_tab == id { worker.sets = std::mem::take(&mut query.sets); }
+                                else { worker.tab_sets.insert(id, std::mem::take(&mut query.sets)); }
+                                let elapsed = started.elapsed().as_secs_f32();
+                                update_result(&worker.ui, id, move |ui| {
+                                    ui.set_query_running(false);
+                                    ui.set_query_elapsed(elapsed);
+                                    ui.set_query_phase(if result.is_ok() { 3 } else { 4 });
+                                    ui.set_query_error(result.err().unwrap_or_default().into());
+                                    ui.invoke_query_state_changed(id, false);
+                                });
+                            }
+                            continue;
+                        },
+                        reconnected = reconnects.join_next(), if !reconnects.is_empty() => {
+                            if let Some(Ok((profile, Ok(session)))) = reconnected {
+                                if worker.active.as_ref().is_some_and(|(active, _)| active == &profile)
+                                    && worker.session.as_ref().is_none_or(|session| session.client.is_closed()) {
+                                    worker.session = Some(session);
+                                    worker.session_profile = Some(profile);
+                                }
+                            }
+                            update(&worker.ui, |ui| ui.set_reconnecting(false));
+                            continue;
+                        },
+                        _ = heartbeat.tick() => {
+                            if closing.load(Ordering::Relaxed) {
+                                for cancel in cancellations.values() { cancel.store(true, Ordering::Relaxed); }
+                                if queries.is_empty() {
+                                    closing.store(false, Ordering::Relaxed);
+                                    update(&worker.ui, |ui| ui.invoke_close_documents());
+                                }
+                            }
+                            let connected = worker.session.as_ref().is_some_and(|session| !session.client.is_closed());
+                            if !connected && !closing.load(Ordering::Relaxed) && reconnects.is_empty() && last_reconnect.elapsed() >= Duration::from_secs(5) {
+                                if let Some((profile, password)) = worker.active.clone() {
+                                    last_reconnect = Instant::now();
+                                    update(&worker.ui, |ui| ui.set_reconnecting(true));
+                                    reconnects.spawn(async move {
+                                        let result = tokio::time::timeout(Duration::from_secs(20), db::connect(&profile, &password)).await
+                                            .unwrap_or_else(|_| Err("TIMEOUT".into()));
+                                        (profile, result)
+                                    });
+                                }
+                            }
+                            update(&worker.ui, move |ui| ui.set_connected(connected));
+                            continue;
+                        }
+                    };
+                    open_documents = request.open_documents.iter().copied().collect();
+                    if let Command::CloseDocument(id) = &request.command {
+                        open_documents.remove(id);
+                        sessions.remove(id);
+                        worker.tab_sets.remove(id);
+                        if worker.result_tab == *id { worker.sets.clear(); }
+                        if let Some(cancel) = cancellations.get(id) { cancel.store(true, Ordering::Relaxed); }
+                        continue;
+                    }
+                    if let Command::Cancel(id) = &request.command {
+                        if let Some(cancel) = cancellations.get(id) { cancel.store(true, Ordering::Relaxed); }
+                        continue;
+                    }
+                    sessions.retain(|id, _| request.open_documents.contains(id));
+                    for (id, cancel) in &cancellations {
+                        if !request.open_documents.contains(id) { cancel.store(true, Ordering::Relaxed); }
+                    }
+                    if matches!(&request.command, Command::Run(..)) {
+                        if cancellations.contains_key(&request.document_id) { continue; }
+                        let cancelled = Arc::new(AtomicBool::new(false));
+                        cancellations.insert(request.document_id, cancelled.clone());
+                        let (session, session_profile) = sessions.remove(&request.document_id).unwrap_or((None, None));
+                        let mut query = Worker {
+                            ui: worker.ui.clone(), settings: worker.settings.clone(), session, session_profile,
+                            active: worker.active.clone(), sets: Vec::new(), tab_sets: std::collections::HashMap::new(),
+                            result_tab: request.document_id, cancelled, zh: request.zh, settings_error: worker.settings_error.clone(),
+                            current_schema: worker.current_schema.clone(), metadata_cache: cache::MetadataCache::default(), query_only: true,
+                        };
+                        queries.spawn(async move {
+                            let result = query.handle(request.command).await;
+                            (request.document_id, query, result, request.started)
+                        });
+                        continue;
+                    }
                     if worker.result_tab != request.document_id {
                         worker.tab_sets.insert(worker.result_tab, std::mem::take(&mut worker.sets));
                         worker.sets = worker.tab_sets.remove(&request.document_id).unwrap_or_default();
@@ -1516,25 +1705,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         _ => None,
                     };
                     let fields_request = matches!(&request.command, Command::Fields(..));
-                    let query_request = matches!(&request.command, Command::Run(..));
+                    let browser_refresh = matches!(&request.command, Command::Refresh | Command::RefreshSchema);
                     let notify_success = matches!(&request.command, Command::Fields(_, _, action) if action == "copy-structure") || !matches!(&request.command,
                         Command::Run(..) | Command::Page(..) | Command::Tables(..) |
                         Command::Fields(..) | Command::ScopeChoices(..) | Command::OpenScopes |
                         Command::LoadProfile(..) | Command::UseProfile(..));
                     let result = worker.handle(request.command).await;
-                    let elapsed = request.started.elapsed().as_secs_f32();
-                    let connected = worker.active.is_some();
+                    let connected = worker.session.as_ref().is_some_and(|session| !session.client.is_closed());
                     let zh = worker.zh;
-                    let close_pending = closing.clone();
                     update(&worker.ui, move |ui| {
                         ui.set_busy(false);
+                        if browser_refresh { ui.set_browser_refresh(0); }
                         if fields_request { ui.set_fields_loading(false); }
-                        if query_request {
-                            ui.set_query_running(false);
-                            ui.set_query_elapsed(elapsed);
-                            ui.set_query_phase(tr(zh, if result.is_ok() { "查询完成" } else { "查询已停止" }, if result.is_ok() { "Query complete" } else { "Query stopped" }).into());
-                        }
                         ui.set_connected(connected);
+                        ui.set_reconnecting(false);
                         match result {
                             Ok(message) => {
                                 ui.set_failed(false);
@@ -1544,18 +1728,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Err(error) => {
                                 ui.set_failed(true);
                                 ui.set_status(
-                                    if query_request { explain(false, error) } else { format!(
+                                    format!(
                                         "{}\n{}",
                                         tr(zh, "操作失败", "Operation failed"),
                                         explain(zh, error)
-                                    ) }
+                                    )
                                     .into(),
                                 );
                             }
                         }
-                        if close_pending.swap(false, Ordering::Relaxed) {
-                            ui.invoke_close_documents();
-                        } else if connected {
+                        if connected {
                             use slint::Model;
                             if let Some((schema, table)) = selected_fields {
                                 if let Some(selected) =
@@ -1581,9 +1763,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         };
         if action == "copy-error" {
-            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(ui.get_status().to_string())) {
+            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(explain(ui.global::<I18n>().get_zh(), ui.get_displayed_error().to_string()))) {
                 Ok(()) => ui.invoke_notify(tr(ui.global::<I18n>().get_zh(), "已复制", "Copied").into()),
-                Err(error) => ui.invoke_notify(error.to_string().into()),
+                Err(error) => { ui.set_failed(true); ui.set_status(error.to_string().into()); }
             }
             return;
         }
@@ -1594,7 +1776,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let additions: Vec<BrowserScope> = ui.get_scope_schemas().row_data(ui.get_scope_schema_index() as usize).into_iter()
                 .map(|choice| BrowserScope { profile: choice.profile, database: choice.database, schema: choice.schema }).collect();
             if additions.is_empty() || additions.iter().any(|scope| scope.profile.is_empty() || scope.database.is_empty() || scope.schema.is_empty()) {
-                ui.invoke_notify(tr(ui.global::<I18n>().get_zh(), "请先选择连接、库名和模式", "Select connections, databases and schemas first").into());
+                ui.set_failed(true);
+                ui.set_status(tr(ui.global::<I18n>().get_zh(), "请先选择连接、库名和模式", "Select connections, databases and schemas first").into());
                 return;
             }
             let mut scopes: Vec<_> = ui.get_browser_scopes().iter().collect();
@@ -1637,7 +1820,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         if action == "cancel" {
-            cancel.store(true, Ordering::Relaxed);
+            if ui.get_query_running() { submit(&ui, &sender, &cancel, Command::Cancel(ui.get_active_document())); }
+            else { cancel.store(true, Ordering::Relaxed); }
             return;
         }
         if action == "new-profile" {
@@ -1673,8 +1857,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         let result = match action.as_str() {
-            "save-timeout" => ui.get_timeout_input().trim().parse::<u64>().ok().filter(|timeout| (1..=3600).contains(timeout)).map(Command::SaveTimeout)
-                .ok_or_else(|| tr(ui.global::<I18n>().get_zh(), "请输入 1–3600 之间的整数秒数", "Enter a whole number of seconds from 1 to 3600")),
+            "save-timeout" => ui.get_timeout_input().trim().parse::<u64>().ok().filter(|timeout| (1..=3600).contains(timeout)).map(|minutes| Command::SaveTimeout(minutes * 60))
+                .ok_or_else(|| tr(ui.global::<I18n>().get_zh(), "请输入 1–3600 之间的整数分钟数", "Enter a whole number of minutes from 1 to 3600")),
             "scope-settings" => Ok(Command::OpenScopes),
             "save-scopes" => {
                 use slint::Model;
@@ -1685,18 +1869,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "connect" => {
                 profile_from_ui(&ui).map(|p| Command::Connect(p, ui.get_password().to_string()))
             }
+            "reconnect" => { ui.set_reconnecting(true); Ok(Command::Reconnect) }
             "save-profile" => {
                 profile_from_ui(&ui).map(|p| Command::SaveProfile(p, ui.get_password().to_string(), (ui.get_profile_index() >= 0).then_some(ui.get_profile_index() as usize)))
             }
             "delete-profile" => Ok(Command::DeleteProfile(ui.get_profile_index() as usize)),
             "disconnect" => Ok(Command::Disconnect),
             "refresh" => Ok(Command::Refresh),
+            "refresh-schema" => Ok(Command::RefreshSchema),
             "hide-object" | "restore-object" => ui.get_tables().row_data(ui.get_table_index() as usize)
                 .map(|object| Command::SetObjectHidden(object.text.to_string(), ui.get_object_kind(), action == "hide-object"))
                 .ok_or_else(|| tr(ui.global::<I18n>().get_zh(), "请先选择对象", "Select an object first")),
             "run" => Ok(Command::Run(
                 ui.get_sql().to_string(),
-                ui.get_timeout().clamp(1, 3600) as u64,
+                ui.get_timeout().clamp(1, 3600) as u64 * 60,
             )),
             "import" => Ok(Command::ImportSql),
             "save-sql" => Ok(Command::SaveSql(ui.get_sql().to_string(), ui.get_document_title().to_string())),
@@ -1850,6 +2036,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.on_filter_objects(move || {
         if let Some(ui) = weak.upgrade() {
             filter_objects(&ui);
+        }
+    });
+    let weak = ui.as_weak();
+    let completion_sender = tx.clone();
+    let completion_cancel = cancelled.clone();
+    ui.on_complete_sql(move |sql, offset| {
+        let Some(ui) = weak.upgrade() else { return ModelRc::default(); };
+        let index: Vec<(String, Vec<String>)> = ui.get_column_index().iter().filter_map(|entry| serde_json::from_str(entry.as_str()).ok()).collect();
+        let tables: Vec<_> = ui.get_tables().iter().map(|object| (object.text.to_string(), index.iter().find(|(name, _)| name == object.text.as_str()).map(|(_, columns)| columns.clone()).unwrap_or_default())).collect();
+        let mut missing = None;
+        let suggestions = completion::suggest(&sql, offset.max(0) as usize, &tables, &ui.get_schema(), &mut missing);
+        if let Some(table) = missing.filter(|_| !ui.get_busy() && ui.get_connected()) {
+            submit(&ui, &completion_sender, &completion_cancel, Command::Fields(ui.get_schema().to_string(), table, "completion".into()));
+        }
+        strings(suggestions)
+    });
+    ui.on_insert_completion(|sql, offset, value| completion::insert(&sql, offset.max(0) as usize, &value));
+    ui.on_localize_error(|error, zh| explain(zh, error.to_string()).into());
+    let weak = ui.as_weak();
+    let sender = tx.clone();
+    ui.on_document_closed(move |id| {
+        if let Some(ui) = weak.upgrade() {
+            let _ = sender.try_send(Request { command: Command::CloseDocument(id), zh: ui.global::<I18n>().get_zh(), started: Instant::now(), document_id: id, open_documents: ui.get_sql_tabs().iter().map(|tab| tab.id).filter(|open| *open != id).collect() });
         }
     });
     let weak = ui.as_weak();
@@ -2034,6 +2243,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let sender = tx.clone();
     let cancel = cancelled.clone();
+    ui.on_close_result(move |index| {
+        if let Some(ui) = weak.upgrade() {
+            submit(&ui, &sender, &cancel, Command::CloseResult(index as usize, ui.get_result_index().max(0) as usize));
+        }
+    });
+    let weak = ui.as_weak();
+    let sender = tx.clone();
+    let cancel = cancelled.clone();
     ui.on_change_page(move |page| {
         if let Some(ui) = weak.upgrade() {
             submit(
@@ -2073,6 +2290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cancel = cancelled.clone();
     ui.on_language_changed(move || {
         if let Some(ui) = weak.upgrade() {
+            localize_result(&ui);
             prefix_options(&ui);
             submit(
                 &ui,

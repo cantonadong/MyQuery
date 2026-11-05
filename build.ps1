@@ -43,10 +43,10 @@ try {
 }
 & cargo +stable-x86_64-pc-windows-gnu build --release --locked
 if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
-$appProcesses = Get-Process -Name SqlDesk,sql-desk -ErrorAction SilentlyContinue
+$appProcesses = Get-Process -Name MyQuery,SqlDesk,sql-desk -ErrorAction SilentlyContinue
 if ($appProcesses) {
     $appProcesses | Stop-Process -Force
     $appProcesses | Wait-Process -Timeout 10
 }
-Copy-Item -LiteralPath 'target/release/sql-desk.exe' -Destination 'SqlDesk.exe' -Force
-Get-Item -LiteralPath 'SqlDesk.exe' | Select-Object FullName,Length,LastWriteTime
+Copy-Item -LiteralPath 'target/release/sql-desk.exe' -Destination 'MyQuery.exe' -Force
+Get-Item -LiteralPath 'MyQuery.exe' | Select-Object FullName,Length,LastWriteTime

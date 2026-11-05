@@ -8,9 +8,24 @@ struct Document {
     text: String,
     saved: String,
     name: Option<String>,
+    running: bool,
     results: Option<ResultView>,
 }
 struct ResultView {
+    captured: std::time::Instant,
+    error: SharedString,
+    running: bool,
+    has_run: bool,
+    elapsed: f32,
+    phase: i32,
+    received: SharedString,
+    status: bool,
+    selected_row: i32,
+    selected_rows: ModelRc<bool>,
+    selected_cells: ModelRc<bool>,
+    selected_count: i32,
+    selection_anchor: i32,
+    cell_anchor: i32,
     names: ModelRc<SharedString>,
     columns: ModelRc<TableColumn>,
     rows: ModelRc<ModelRc<StandardListViewItem>>,
@@ -21,12 +36,26 @@ struct ResultView {
 }
 impl ResultView {
     fn capture(ui: &AppWindow) -> Self {
-        Self { names: ui.get_result_names(), columns: ui.get_result_columns(), rows: ui.get_result_rows(), index: ui.get_result_index(), page: ui.get_page(), pages: ui.get_pages(), count: ui.get_row_count() }
+        Self { selected_row: ui.get_selected_row(), selected_rows: ui.get_selected_rows(), selected_cells: ui.get_selected_cells(), selected_count: ui.get_selected_count(), selection_anchor: ui.get_selection_anchor(), cell_anchor: ui.get_cell_anchor_column(), status: ui.get_result_status(), captured: std::time::Instant::now(), error: ui.get_query_error(), running: ui.get_query_running(), has_run: ui.get_query_has_run(), elapsed: ui.get_query_elapsed(), phase: ui.get_query_phase(), received: ui.get_query_rows(), names: ui.get_result_names(), columns: ui.get_result_columns(), rows: ui.get_result_rows(), index: ui.get_result_index(), page: ui.get_page(), pages: ui.get_pages(), count: ui.get_row_count() }
     }
     fn restore(&self, ui: &AppWindow) {
+        ui.set_query_error(self.error.clone());
+        ui.set_query_running(self.running);
+        ui.set_query_has_run(self.has_run);
+        ui.set_query_elapsed(self.elapsed + if self.running { self.captured.elapsed().as_secs_f32() } else { 0.0 });
+        ui.set_query_phase(self.phase);
+        ui.set_query_rows(self.received.clone());
+        ui.set_selected_row(self.selected_row);
+        ui.set_selected_rows(self.selected_rows.clone());
+        ui.set_selected_cells(self.selected_cells.clone());
+        ui.set_selected_count(self.selected_count);
+        ui.set_selection_anchor(self.selection_anchor);
+        ui.set_cell_anchor_column(self.cell_anchor);
         ui.set_result_names(self.names.clone());
         ui.set_result_columns(self.columns.clone());
         ui.set_result_rows(self.rows.clone());
+        ui.set_result_status(self.status);
+        crate::localize_result(ui);
         ui.set_result_index(self.index);
         ui.set_page(self.page);
         ui.set_pages(self.pages);
@@ -71,9 +100,11 @@ impl Documents {
                 id: doc.id,
                 title: doc.title().into(),
                 dirty: doc.dirty(),
+                running: doc.running,
             })
             .collect::<Vec<_>>();
         ui.set_sql_tabs(Rc::new(VecModel::from(tabs)).into());
+        ui.set_queries_running(self.tabs.iter().any(|doc| doc.running));
         ui.set_active_sql(self.active as i32);
         ui.set_active_document(self.tabs[self.active].id);
         ui.set_document_title(self.tabs[self.active].title().into());
@@ -135,6 +166,7 @@ impl Documents {
             path,
             saved: text.clone(),
             name: None,
+            running: false,
             results: None,
             text,
         });
@@ -148,6 +180,7 @@ impl Documents {
             crate::clear_results(ui);
         }
         self.tabs.remove(index);
+        ui.invoke_document_closed(id);
         if self.tabs.is_empty() {
             self.add(ui, None, String::new());
             return;
@@ -222,6 +255,7 @@ pub fn bind(ui: &AppWindow) -> Rc<RefCell<Documents>> {
             text: ui.get_sql().to_string(),
             saved: String::new(),
             name: None,
+            running: false,
             results: None,
         }],
         active: 0,
@@ -230,6 +264,15 @@ pub fn bind(ui: &AppWindow) -> Rc<RefCell<Documents>> {
         prompt_id: None,
     }));
     state.borrow().sync(ui);
+    let docs = state.clone();
+    let weak = ui.as_weak();
+    ui.on_query_state_changed(move |id, running| {
+        if let Some(ui) = weak.upgrade() {
+            let mut docs = docs.borrow_mut();
+            if let Some(doc) = docs.tabs.iter_mut().find(|doc| doc.id == id) { doc.running = running; }
+            docs.sync(&ui);
+        }
+    });
     let docs = state.clone();
     let weak = ui.as_weak();
     ui.on_result_update_begin(move |id| {
@@ -432,6 +475,7 @@ mod tests {
             text: "SELECT 1;".into(),
             saved: "SELECT 1;".into(),
             name: None,
+            running: false,
             results: None,
         };
         assert!(!doc.dirty());
