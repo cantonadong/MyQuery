@@ -3,12 +3,27 @@ use crate::{
     results::{Cells, MAX_BYTES, MAX_ROW, ResultSet},
 };
 use futures_util::{TryStreamExt, pin_mut};
-use std::time::{Duration, Instant};
+use std::{sync::Arc, time::{Duration, Instant}};
 use tokio_postgres::{Client, SimpleQueryMessage};
 
 pub struct Session {
-    pub client: Client,
+    pub client: Arc<Client>,
     connection: tokio::task::JoinHandle<()>,
+    heartbeat: tokio::task::JoinHandle<()>,
+}
+
+impl Session {
+    fn new(client: Client, connection: tokio::task::JoinHandle<()>) -> Self {
+        let client = Arc::new(client);
+        let heartbeat_client = client.clone();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if heartbeat_client.check_connection().await.is_err() { break; }
+            }
+        });
+        Self { client, connection, heartbeat }
+    }
 }
 
 pub struct QueryFailure {
@@ -43,6 +58,7 @@ pub fn query_error(source: tokio_postgres::Error) -> QueryFailure {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.heartbeat.abort();
         self.connection.abort();
     }
 }
@@ -81,7 +97,10 @@ pub async fn connect(profile: &Profile, password: &str) -> Result<Session, Strin
         .user(&profile.user)
         .password(password)
         .application_name("SqlDesk")
-        .connect_timeout(Duration::from_secs(15));
+        .connect_timeout(Duration::from_secs(15))
+        .keepalives(true)
+        .keepalives_idle(Duration::from_secs(30))
+        .keepalives_interval(Duration::from_secs(10));
     if profile.tls {
         config.ssl_mode(tokio_postgres::config::SslMode::Require);
         let tls = tls_connector(profile)?;
@@ -92,14 +111,14 @@ pub async fn connect(profile: &Profile, password: &str) -> Result<Session, Strin
         let connection = tokio::spawn(async move {
             let _ = connection.await;
         });
-        Ok(Session { client, connection })
+        Ok(Session::new(client, connection))
     } else {
         config.ssl_mode(tokio_postgres::config::SslMode::Disable);
         let (client, connection) = config.connect(tokio_postgres::NoTls).await.map_err(error)?;
         let connection = tokio::spawn(async move {
             let _ = connection.await;
         });
-        Ok(Session { client, connection })
+        Ok(Session::new(client, connection))
     }
 }
 
@@ -109,6 +128,26 @@ pub fn tls_connector(profile: &Profile) -> Result<native_tls::TlsConnector, Stri
         .danger_accept_invalid_hostnames(profile.trust_server_certificate)
         .build()
         .map_err(|e| e.to_string())
+}
+
+pub fn columns_sql(schema: &str, table: Option<&str>, redshift: bool) -> String {
+    if redshift {
+        format!(
+            "SELECT {}column_name, CASE WHEN LOWER(data_type) IN ('character varying', 'varchar', 'nvarchar', 'character', 'char', 'nchar', 'bpchar') AND character_maximum_length IS NOT NULL THEN CASE WHEN LOWER(data_type) IN ('character varying', 'varchar', 'nvarchar') THEN 'varchar' ELSE 'char' END || '(' || CAST(character_maximum_length AS VARCHAR(20)) || ')' WHEN LOWER(data_type) IN ('numeric', 'decimal') AND numeric_precision IS NOT NULL AND numeric_scale IS NOT NULL THEN data_type || '(' || CAST(numeric_precision AS VARCHAR(20)) || ',' || CAST(numeric_scale AS VARCHAR(20)) || ')' ELSE data_type END, is_nullable, column_default, CASE LOWER(data_type) WHEN 'smallint' THEN 2 WHEN 'int2' THEN 2 WHEN 'integer' THEN 4 WHEN 'int' THEN 4 WHEN 'int4' THEN 4 WHEN 'bigint' THEN 8 WHEN 'int8' THEN 8 WHEN 'real' THEN 4 WHEN 'float4' THEN 4 WHEN 'double precision' THEN 8 WHEN 'float8' THEN 8 WHEN 'float' THEN 8 WHEN 'boolean' THEN 1 WHEN 'bool' THEN 1 WHEN 'date' THEN 4 WHEN 'time' THEN 8 WHEN 'time without time zone' THEN 8 WHEN 'timetz' THEN 8 WHEN 'time with time zone' THEN 8 ELSE NULL END FROM svv_all_columns WHERE database_name = current_database() AND schema_name = {}{} ORDER BY {}ordinal_position",
+            if table.is_none() { "table_name, " } else { "" },
+            literal(schema, true),
+            table.map(|table| format!(" AND table_name = {}", literal(table, true))).unwrap_or_default(),
+            if table.is_none() { "table_name, " } else { "" },
+        )
+    } else {
+        format!(
+            "SELECT {}a.attname, pg_catalog.format_type(a.atttypid,a.atttypmod), CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END, pg_catalog.pg_get_expr(d.adbin,d.adrelid), t.typlen FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid=a.atttypid JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE n.nspname={}{} AND a.attnum>0 AND NOT a.attisdropped ORDER BY {}a.attnum",
+            if table.is_none() { "c.relname, " } else { "" },
+            literal(schema, false),
+            table.map(|table| format!(" AND c.relname={}", literal(table, false))).unwrap_or_else(|| " AND c.relkind IN ('r','p','f','v','m')".into()),
+            if table.is_none() { "c.relname, " } else { "" },
+        )
+    }
 }
 
 pub async fn metadata(client: &Client, sql: &str) -> Result<Vec<Cells>, QueryFailure> {
@@ -138,7 +177,7 @@ pub async fn metadata(client: &Client, sql: &str) -> Result<Vec<Cells>, QueryFai
     Ok(rows)
 }
 
-pub async fn execute(client: &Client, sql: &str, zh: bool, mut progress: impl FnMut(usize)) -> Result<(Vec<ResultSet>, u64), QueryFailure> {
+pub async fn execute(client: &Client, sql: &str, mut progress: impl FnMut(usize)) -> Result<(Vec<ResultSet>, u64), QueryFailure> {
     let stream = client.simple_query_raw(sql).await.map_err(query_error)?;
     pin_mut!(stream);
     let mut sets: Vec<ResultSet> = Vec::new();
@@ -152,7 +191,7 @@ pub async fn execute(client: &Client, sql: &str, zh: bool, mut progress: impl Fn
             SimpleQueryMessage::RowDescription(columns) => {
                 has_rowset = true;
                 progress(received);
-                if sets.len() >= 32 || columns.len() > 256 {
+                if columns.len() > 256 {
                     return Err("LIMIT_COLUMNS".into());
                 }
                 sets.push(ResultSet::new(
@@ -185,11 +224,26 @@ pub async fn execute(client: &Client, sql: &str, zh: bool, mut progress: impl Fn
             }
             SimpleQueryMessage::CommandComplete(count) => {
                 affected = affected.saturating_add(count);
-                if !has_rowset {
-                    if sets.len() >= 32 { return Err("LIMIT_COLUMNS".into()); }
-                    let mut set = ResultSet::new(vec![crate::tr(zh, "状态", "Status"), crate::tr(zh, "影响行数", "Affected rows")])?;
-                    bytes += set.push(vec![Some(crate::tr(zh, "执行成功", "Success")), Some(count.to_string())])?;
+                let mut set = if has_rowset {
+                    sets.pop().ok_or("Missing result header")?
+                } else {
+                    let mut set = ResultSet::new(vec!["Status".into(), "Affected rows".into()])?;
+                    set.status = true;
+                    bytes += set.push(vec![Some("Success".into()), Some(count.to_string())])?;
                     if bytes > MAX_BYTES { return Err("LIMIT_RESULT".into()); }
+                    set
+                };
+                set.finish()?;
+                let mut duplicate = false;
+                for previous in &mut sets {
+                    if previous.status == set.status && previous.same_content(&mut set)? {
+                        previous.repeats += 1;
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if !duplicate {
+                    if sets.len() >= 32 { return Err("LIMIT_COLUMNS".into()); }
                     sets.push(set);
                 }
                 has_rowset = false;

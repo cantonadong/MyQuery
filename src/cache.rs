@@ -59,6 +59,26 @@ fn key(profile: &Profile, sql: &str) -> String {
 }
 
 impl MetadataCache {
+    pub fn schema_columns(&self, profile: &Profile, schema: &str, table: &str) -> Option<Vec<Cells>> {
+        let entry = self.entries.get(&key(profile, &crate::db::columns_sql(schema, None, profile.redshift)))?;
+        (entry.day == today()).then(|| entry.rows.iter().filter(|row| row.first().and_then(|cell| cell.as_deref()) == Some(table)).map(|row| row[1..].to_vec()).collect())
+    }
+    pub fn changed_schema_columns(&self, profile: &Profile, schema: &str, table: &str, rows: &[Cells]) -> Vec<bool> {
+        let previous = self.entries.get(&key(profile, &crate::db::columns_sql(schema, None, profile.redshift))).and_then(|entry| entry.previous.as_ref());
+        rows.iter().map(|row| previous.is_some_and(|old| !old.iter().any(|old| old.first().and_then(|cell| cell.as_deref()) == Some(table) && old.get(1..3) == row.get(..2)))).collect()
+    }
+    pub fn columns(&self, profile: &Profile, schema: &str, table: &str) -> Vec<String> {
+        if let Some(rows) = self.schema_columns(profile, schema, table) { return rows.into_iter().filter_map(|row| row.into_iter().next().flatten()).collect(); }
+        let schema = crate::db::literal(schema, profile.redshift);
+        let table = crate::db::literal(table, profile.redshift);
+        self.entries.iter().find_map(|(saved, entry)| {
+            let (identity, database, sql) = serde_json::from_str::<(String, String, String)>(saved).ok()?;
+            (identity == connection(profile) && database == profile.database &&
+                (sql.contains(&format!("n.nspname={schema} AND c.relname={table} AND")) ||
+                 sql.contains(&format!("schema_name = {schema} AND table_name = {table} ORDER BY"))))
+                .then(|| entry.rows.iter().filter_map(|row| row.first().cloned().flatten()).collect())
+        }).unwrap_or_default()
+    }
     pub fn load() -> Self {
         let Some(path) = path() else {
             return Self::default();
@@ -117,12 +137,21 @@ impl MetadataCache {
         rows.iter().map(|row| previous.is_some_and(|old| !old.iter().any(|r| r.get(..2) == row.get(..2)))).collect()
     }
     pub fn changed_tables(&self, profile: &Profile, schema: &str, objects: &[crate::DbObject]) -> Vec<String> {
+        let mut changed = Vec::new();
+        if let Some(entry) = self.entries.get(&key(profile, &crate::db::columns_sql(schema, None, profile.redshift))) {
+            if let Some(previous) = &entry.previous {
+                for object in objects {
+                    let current = entry.rows.iter().filter(|row| row.first().and_then(|cell| cell.as_deref()) == Some(object.name.as_str())).map(|row| row.get(1..3));
+                    let old = previous.iter().filter(|row| row.first().and_then(|cell| cell.as_deref()) == Some(object.name.as_str())).map(|row| row.get(1..3));
+                    if !current.eq(old) { changed.push(object.name.to_string()); }
+                }
+            }
+        }
         let identity = connection(profile);
         let schema = crate::db::literal(schema, profile.redshift);
-        let mut changed = Vec::new();
         for (saved_key, entry) in &self.entries {
             let Ok((saved_identity, database, sql)) = serde_json::from_str::<(String, String, String)>(saved_key) else { continue; };
-            if saved_identity != identity || database != profile.database { continue; }
+            if saved_identity != identity || database != profile.database || entry.day == 0 { continue; }
             let Some(previous) = &entry.previous else { continue; };
             if entry.rows.iter().map(|row| row.get(..2)).eq(previous.iter().map(|row| row.get(..2))) { continue; }
             for object in objects {
@@ -170,6 +199,24 @@ impl MetadataCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn schema_refresh_replaces_fields_and_types_for_each_table() {
+        let profile = Profile { database: "dev".into(), ..Profile::default() };
+        let sql = crate::db::columns_sql("public", None, false);
+        let mut cache = MetadataCache::default();
+        cache.entries.insert(key(&profile, &sql), Entry {
+            connection: connection(&profile), fetched: now(), day: today(),
+            rows: vec![vec![Some("orders".into()), Some("id".into()), Some("bigint".into())], vec![Some("people".into()), Some("name".into()), Some("text".into())]],
+            previous: Some(vec![vec![Some("orders".into()), Some("id".into()), Some("integer".into())]]),
+        });
+        assert_eq!(cache.columns(&profile, "public", "orders"), vec!["id"]);
+        let rows = cache.schema_columns(&profile, "public", "orders").unwrap();
+        assert_eq!(rows[0][1].as_deref(), Some("bigint"));
+        assert_eq!(cache.changed_schema_columns(&profile, "public", "orders", &rows), vec![true]);
+        assert_eq!(cache.columns(&profile, "public", "people"), vec!["name"]);
+        let other_database = Profile { database: "prod".into(), ..profile };
+        assert!(cache.schema_columns(&other_database, "public", "orders").is_none());
+    }
     #[test]
     fn column_changes_include_types_and_clear_on_the_next_snapshot() {
         let profile = Profile { database: "dev".into(), ..Profile::default() };

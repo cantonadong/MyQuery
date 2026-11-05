@@ -1,27 +1,16 @@
 import { ScrollView, LineEdit, HorizontalBox } from "std-widgets.slint";
+import { ActionButton, PopupMenu, PopupRow } from "controls.slint";
 import { Theme } from "theme.slint";
 
 export struct SearchMatch { start: int, end: int, count: int, ordinal: int }
 
-export struct SqlRun { text: string, color: color, source: string, offset: int }
+export struct SqlRun { text: string, color: color, source: string, offset: int, end: int }
+export struct SqlCompletion { text: string, offset: int }
 
-component FindButton inherits Rectangle {
-    in property <string> text;
+component FindButton inherits ActionButton {
     in property <string> label;
-    in property <bool> enabled: true;
-    callback clicked();
-    width: 28px; height: 24px; horizontal-stretch: 0; vertical-stretch: 0;
-    border-radius: 4px; border-width: 1px;
-    border-color: focus.has-focus ? Theme.focus : Theme.border;
-    background: touch.has-hover && root.enabled ? Theme.hover : Theme.surface;
-    accessible-role: button; accessible-label: root.label; accessible-enabled: root.enabled;
-    accessible-action-default => { if root.enabled { root.clicked(); } }
-    Text { width: 100%; height: 100%; text: root.text; font-size: 12px; color: Theme.text; opacity: root.enabled ? 1 : 0.4; horizontal-alignment: center; vertical-alignment: center; }
-    focus := FocusScope {
-        width: 100%; height: 100%; enabled: root.enabled;
-        key-pressed(event) => { if event.text == Key.Return || event.text == Key.Space { root.clicked(); return accept; } return reject; }
-        touch := TouchArea { clicked => { focus.focus(); root.clicked(); } }
-    }
+    accessible-label: root.label;
+    width: 24px;
 }
 
 export component SqlEditor inherits Rectangle {
@@ -30,7 +19,29 @@ export component SqlEditor inherits Rectangle {
     in property <bool> zh;
     in property <[[SqlRun]]> lines;
     in property <string> highlighted-source;
+    in property <int> completion-revision;
+    changed completion-revision => { if input.has-focus { root.refresh-completion(); } }
     callback highlight(string);
+    callback complete(string, int) -> [string];
+    callback insert-completion(string, int, string) -> SqlCompletion;
+    private property <[string]> suggestions;
+    private property <int> suggestion-index;
+    private property <int> completion-offset;
+    private property <bool> completion-pending;
+    Timer { interval: 60ms; running: root.completion-pending; triggered => { root.completion-pending = false; root.refresh-completion(); } }
+    function refresh-completion() {
+        root.completion-offset = input.cursor-position-byte-offset;
+        root.suggestions = root.read-only || root.find-open ? [] : root.complete(root.text, root.completion-offset);
+        root.suggestion-index = 0;
+    }
+    function choose-completion(index: int) {
+        let value = root.suggestions[index];
+        let edit = root.insert-completion(root.text, root.completion-offset, value);
+        input.text = edit.text;
+        input.set-selection-offsets(edit.offset, edit.offset);
+        root.suggestions = [];
+        input.focus();
+    }
     callback save();
     callback find(string, int, bool) -> SearchMatch;
     private property <bool> find-open;
@@ -55,7 +66,7 @@ export component SqlEditor inherits Rectangle {
     background: Theme.surface;
     border-width: 1px;
     border-color: input.has-focus ? Theme.focus : Theme.border;
-    border-radius: 4px;
+    border-radius: Theme.control-radius;
     forward-focus: input;
     changed text => { root.refresh-find(); root.highlight(root.text); metric.set-selection-offsets(3, 3); }
     init => { root.highlight(root.text); metric.set-selection-offsets(3, 3); }
@@ -63,14 +74,15 @@ export component SqlEditor inherits Rectangle {
         visible: false; text: "Mg\nMg"; single-line: false; wrap: no-wrap; font-family: "Consolas"; font-size: 13px;
         cursor-position-changed(pos) => { if pos.y > 0px { root.line-height = pos.y; } }
     }
-    ContextMenuArea {
+    PopupMenu {
         x: 5px; y: 5px; width: parent.width - 10px; height: parent.height - self.y - 5px;
-        Menu {
-            MenuItem { title: root.zh ? "剪切" : "Cut"; enabled: !root.read-only; activated => { input.cut(); } }
-            MenuItem { title: root.zh ? "复制" : "Copy"; activated => { input.copy(); } }
-            MenuItem { title: root.zh ? "粘贴" : "Paste"; enabled: !root.read-only; activated => { input.paste(); } }
-            MenuItem { title: root.zh ? "全选" : "Select all"; activated => { input.select-all(); } }
-        }
+        actions: [
+            { text: root.zh ? "剪切" : "Cut", enabled: !root.read-only, checked: false },
+            { text: root.zh ? "复制" : "Copy", enabled: true, checked: false },
+            { text: root.zh ? "粘贴" : "Paste", enabled: !root.read-only, checked: false },
+            { text: root.zh ? "全选" : "Select all", enabled: true, checked: false }
+        ];
+        activated(choice) => { if choice == 0 { input.cut(); } else if choice == 1 { input.copy(); } else if choice == 2 { input.paste(); } else if choice == 3 { input.select-all(); } }
         scroll := ScrollView {
             content-width: max(self.visible-width, input.preferred-width + 4px);
             content-height: max(self.visible-height, input.preferred-height);
@@ -79,24 +91,20 @@ export component SqlEditor inherits Rectangle {
                 x: 0px; y: index * root.line-height;
                 width: scroll.content-width; height: root.line-height;
                 clip: true;
-                for run in line: Rectangle {
-                    private property <length> run-x;
+                for run in line: TextInput {
                     width: parent.width; height: parent.height;
-                    prefix-metric := TextInput {
-                        visible: false;
-                        text: run.source;
-                        single-line: false; wrap: no-wrap;
-                        font-family: "Consolas"; font-size: 13px;
-                        init => { self.set-selection-offsets(run.offset, run.offset); }
-                        changed text => { self.set-selection-offsets(run.offset, run.offset); }
-                        cursor-position-changed(pos) => { parent.run-x = pos.x; }
-                    }
-                    Text {
-                        x: parent.run-x;
-                        text: run.text; color: Theme.syntax-color(run.color);
-                        font-family: "Consolas"; font-size: 13px;
-                        wrap: no-wrap; vertical-alignment: top;
-                    }
+                    text: run.source; color: transparent;
+                    selection-background-color: transparent;
+                    selection-foreground-color: Theme.syntax-color(run.color);
+                    read-only: true; enabled: false;
+                    single-line: false; wrap: no-wrap; vertical-alignment: top;
+                    font-family: "Consolas"; font-size: 13px;
+                    private property <int> start: run.offset;
+                    private property <int> end: run.end;
+                    init => { self.set-selection-offsets(self.start, self.end); }
+                    changed text => { self.set-selection-offsets(self.start, self.end); }
+                    changed start => { self.set-selection-offsets(self.start, self.end); }
+                    changed end => { self.set-selection-offsets(self.start, self.end); }
                 }
             }
             input := TextInput {
@@ -111,14 +119,22 @@ export component SqlEditor inherits Rectangle {
                 selection-background-color: root.find-open && root.found.start >= 0 ? Theme.search-match : Theme.editor-selection;
                 selection-foreground-color: root.find-open && root.found.start >= 0 ? Theme.search-match-text : Theme.text;
                 page-height: scroll.visible-height;
-                edited => { root.highlight(root.text); }
+                edited => { root.highlight(root.text); root.completion-pending = true; }
                 key-pressed(event) => {
+                    if event.modifiers.control && event.text == Key.Space { root.refresh-completion(); return accept; }
+                    if root.suggestions.length > 0 {
+                        if event.text == Key.DownArrow { root.suggestion-index = mod(root.suggestion-index + 1, root.suggestions.length); return accept; }
+                        if event.text == Key.UpArrow { root.suggestion-index = mod(root.suggestion-index + root.suggestions.length - 1, root.suggestions.length); return accept; }
+                        if event.text == Key.Return || event.text == Key.Tab { root.choose-completion(root.suggestion-index); return accept; }
+                        if event.text == Key.Escape { root.suggestions = []; return accept; }
+                    }
                     if event.modifiers.control && (event.text == "s" || event.text == "S") { root.save(); return accept; }
                     if event.modifiers.control && (event.text == "f" || event.text == "F") { root.open-find(); return accept; }
                     if event.text == Key.Escape && root.find-open { root.close-find(); return accept; }
                     return reject;
                 }
                 cursor-position-changed(pos) => {
+                    root.suggestions = [];
                     root.cursor = pos;
                     if pos.x + scroll.content-x < 0px { scroll.content-x = -pos.x; }
                     if pos.x + scroll.content-x > scroll.visible-width - 4px { scroll.content-x = min(0px, scroll.visible-width - pos.x - 4px); }
@@ -129,13 +145,28 @@ export component SqlEditor inherits Rectangle {
             Rectangle { x: root.cursor.x; y: root.cursor.y; width: 1px; height: root.line-height; background: Theme.text; visible: root.colored && input.has-focus && !root.read-only && input.cursor-position-byte-offset == input.anchor-position-byte-offset; }
         }
     }
+    if root.suggestions.length > 0 && input.has-focus: Rectangle {
+        x: (root.cursor.x + scroll.content-x + 5px).clamp(5px, max(5px, root.width - self.width - 5px));
+        y: (root.cursor.y + scroll.content-y + root.line-height + 5px).clamp(5px, max(5px, root.height - self.height - 5px));
+        width: min(300px, root.width - 10px); height: min(8, root.suggestions.length) * Theme.popup-row-height + 2 * Theme.popup-padding;
+        background: Theme.surface; border-color: Theme.border; border-width: 1px; border-radius: Theme.control-radius;
+        ScrollView {
+            x: Theme.popup-padding; y: Theme.popup-padding; width: parent.width - 2 * Theme.popup-padding; height: parent.height - 2 * Theme.popup-padding;
+            content-height: root.suggestions.length * Theme.popup-row-height;
+            for suggestion[index] in root.suggestions: PopupRow {
+                y: index * Theme.popup-row-height; width: parent.width; text: suggestion; selected: root.suggestion-index == index;
+                hovered => { root.suggestion-index = index; }
+                activated => { root.choose-completion(index); }
+            }
+        }
+    }
     Rectangle {
         visible: root.find-open;
         x: parent.width - self.width - 6px; y: 6px;
         width: min(420px, parent.width - 12px); height: 44px;
-        background: Theme.panel; border-width: 1px; border-color: Theme.border; border-radius: 4px;
+        background: Theme.panel; border-width: 1px; border-color: Theme.border; border-radius: Theme.control-radius;
         TouchArea {}
-        HorizontalBox { padding: 6px; spacing: 4px;
+        HorizontalBox { padding: 6px; spacing: Theme.control-gap;
         search-input := LineEdit {
             height: 32px;
             text <=> root.needle;
@@ -149,9 +180,9 @@ export component SqlEditor inherits Rectangle {
             }
         }
         Text { text: root.found.ordinal + " / " + root.found.count; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
-        Rectangle { width: 28px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "↑"; label: root.zh ? "上一处" : "Previous match"; enabled: root.found.count > 0; clicked => { root.find-next(true); } } }
-        Rectangle { width: 28px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "↓"; label: root.zh ? "下一处" : "Next match"; enabled: root.found.count > 0; clicked => { root.find-next(false); } } }
-        Rectangle { width: 28px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "×"; label: root.zh ? "关闭查找" : "Close find"; clicked => { root.close-find(); } } }
+        Rectangle { width: 24px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "↑"; label: root.zh ? "上一处" : "Previous match"; enabled: root.found.count > 0; clicked => { root.find-next(true); } } }
+        Rectangle { width: 24px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "↓"; label: root.zh ? "下一处" : "Next match"; enabled: root.found.count > 0; clicked => { root.find-next(false); } } }
+        Rectangle { width: 24px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "×"; label: root.zh ? "关闭查找" : "Close find"; clicked => { root.close-find(); } } }
     }
     }
 

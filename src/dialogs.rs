@@ -88,7 +88,7 @@ fn refresh(ui: &AppWindow, dialog: &DialogWindow) {
     dialog.set_rename_sql_open(ui.get_rename_sql_open());
     dialog.set_save_prompt_open(ui.get_save_prompt_open());
     dialog.set_group_open(ui.get_group_open());
-    dialog.set_busy(ui.get_busy());
+    dialog.set_busy(ui.get_busy() || (ui.get_queries_running() && (ui.get_config_open() || ui.get_scopes_open())));
     dialog.set_document_saving(ui.get_document_saving());
     dialog.set_profiles(ui.get_profiles());
     dialog.set_browser_scopes(ui.get_browser_scopes());
@@ -116,7 +116,6 @@ pub fn bind(ui: &AppWindow) -> slint::Timer {
     let active: Rc<RefCell<Option<DialogWindow>>> = Rc::new(RefCell::new(None));
     let syncing = Rc::new(Cell::new(false));
     let timer = slint::Timer::default();
-    let mut previous_error = String::new();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(25), move || {
         let Some(ui) = weak.upgrade() else { return; };
         let mode = if ui.window().is_visible() { selected(&ui) } else { 0 };
@@ -125,7 +124,6 @@ pub fn bind(ui: &AppWindow) -> slint::Timer {
             if let Some(dialog) = active.borrow_mut().take() { let _ = dialog.hide(); }
             let owner = native_window(&ui.get_window_title());
             if !owner.is_null() { unsafe { EnableWindow(owner, 1); SetForegroundWindow(owner); } }
-            previous_error.clear();
         }
         if mode == 0 { return; }
         if active.borrow().is_none() {
@@ -185,19 +183,11 @@ pub fn bind(ui: &AppWindow) -> slint::Timer {
                 unsafe { SetWindowLongPtrW(child, GWLP_HWNDPARENT, owner as isize); EnableWindow(owner, 0); SetForegroundWindow(child); }
             }
             *active.borrow_mut() = Some(dialog);
-            previous_error = if ui.get_failed() { ui.get_status().to_string() } else { String::new() };
         }
         if let Some(dialog) = active.borrow().as_ref() {
             syncing.set(true);
             refresh(&ui, dialog);
             syncing.set(false);
-            if ui.get_failed() && ui.get_status().as_str() != previous_error {
-                previous_error = ui.get_status().to_string();
-                ui.invoke_notify(ui.get_status());
-                dialog.invoke_notify(ui.get_status());
-            } else if !ui.get_failed() {
-                previous_error.clear();
-            }
         }
     });
     timer
