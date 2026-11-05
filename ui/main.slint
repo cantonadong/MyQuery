@@ -219,6 +219,10 @@ export component AppWindow inherits Window {
     in-out property <bool> query-running;
     in-out property <bool> query-has-run;
     in-out property <float> query-elapsed;
+    private property <int> elapsed-seconds: floor(root.query-elapsed);
+    private property <string> elapsed-text: (root.elapsed-seconds >= 3600 ? floor(root.elapsed-seconds / 3600) + "h" : "")
+        + (root.elapsed-seconds >= 60 ? mod(floor(root.elapsed-seconds / 60), 60) + "m" : "")
+        + mod(root.elapsed-seconds, 60) + "s";
     in-out property <int> query-phase;
     private property <string> phase-text: root.query-phase == 0 ? I18n.t("准备连接", "Connecting") : root.query-phase == 1 ? I18n.t("执行 SQL", "Executing SQL") : root.query-phase == 2 ? I18n.t("读取结果", "Receiving results") : root.query-phase == 3 ? I18n.t("查询完成", "Query complete") : I18n.t("查询已停止", "Query stopped");
     in-out property <string> query-rows: "0";
@@ -705,7 +709,7 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         height: 24px; alignment: center; spacing: Theme.control-gap;
                         LoadingIndicator {}
-                        Caption { text: root.phase-text + " · " + I18n.t("耗时：", "Elapsed: ") + floor(root.query-elapsed) + "s · " + I18n.t("已读取 ", "Rows received: ") + root.query-rows; }
+                        Caption { text: root.phase-text + " · " + I18n.t("耗时：", "Elapsed: ") + root.elapsed-text + " · " + I18n.t("已读取 ", "Rows received: ") + root.query-rows; }
                     }
                     HorizontalLayout {
                         height: 24px; alignment: center;
@@ -721,7 +725,7 @@ export component AppWindow inherits Window {
                             spacing: 4px;
                             query-info := Caption {
                                 min-width: 0px; horizontal-stretch: 1; overflow: elide;
-                                text: !root.query-running && root.query-has-run ? root.phase-text + " · " + I18n.t("耗时：", "Elapsed: ") + floor(root.query-elapsed) + "s" + (root.result-index >= 0 ? " · " + I18n.t("已加载 ", "Loaded ") + root.result-rows.length + " / " + root.row-count : "") : "";
+                                text: !root.query-running && root.query-has-run ? root.phase-text + " · " + I18n.t("耗时：", "Elapsed: ") + root.elapsed-text + (root.result-index >= 0 ? " · " + I18n.t("已加载 ", "Loaded ") + root.result-rows.length + " / " + root.row-count : "") : "";
                                 Tooltip { text: @markdown("\{query-info.text}"); }
                             }
                         }
@@ -962,7 +966,7 @@ export component DialogWindow inherits Window {
                 Caption { text: I18n.t("有未保存的修改，是否保存？", "Save changes before closing?"); }
                 HorizontalBox { height: 24px; padding: 0px; spacing: Theme.control-gap; alignment: end;
                     CompactButton { height: 24px; text: I18n.t("保存", "Save"); primary: true; enabled: !root.busy; clicked => { root.action("prompt-save"); } }
-                    CompactButton { height: 24px; text: I18n.t("放弃修改", "Discard"); enabled: !root.busy; clicked => { root.action("prompt-discard"); } }
+                    CompactButton { height: 24px; text: I18n.t("放弃修改", "Discard"); primary: true; destructive: true; enabled: !root.busy; clicked => { root.action("prompt-discard"); } }
                     CompactButton { height: 24px; text: I18n.t("取消", "Cancel"); clicked => { root.action("prompt-cancel"); } }
                 }
             }
