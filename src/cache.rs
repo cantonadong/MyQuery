@@ -60,11 +60,13 @@ fn key(profile: &Profile, sql: &str) -> String {
 
 impl MetadataCache {
     pub fn schema_columns(&self, profile: &Profile, schema: &str, table: &str) -> Option<Vec<Cells>> {
+        if let Some(scope) = load_scope(profile, schema) { return Some(scope.fields.into_iter().filter(|row| row.first().and_then(|v| v.as_deref()) == Some(table)).map(|row| row[1..].to_vec()).collect()); }
         let entry = self.entries.get(&key(profile, &crate::db::columns_sql(schema, None, profile.redshift)))?;
-        (entry.day == today()).then(|| entry.rows.iter().filter(|row| row.first().and_then(|cell| cell.as_deref()) == Some(table)).map(|row| row[1..].to_vec()).collect())
+        (entry.day != 0).then(|| entry.rows.iter().filter(|row| row.first().and_then(|cell| cell.as_deref()) == Some(table)).map(|row| row[1..].to_vec()).collect())
     }
     pub fn changed_schema_columns(&self, profile: &Profile, schema: &str, table: &str, rows: &[Cells]) -> Vec<bool> {
-        let previous = self.entries.get(&key(profile, &crate::db::columns_sql(schema, None, profile.redshift))).and_then(|entry| entry.previous.as_ref());
+        let scope = load_scope(profile, schema);
+        let previous = scope.as_ref().and_then(|scope| scope.previous_fields.as_ref()).or_else(|| self.entries.get(&key(profile, &crate::db::columns_sql(schema, None, profile.redshift))).and_then(|entry| entry.previous.as_ref()));
         rows.iter().map(|row| previous.is_some_and(|old| !old.iter().any(|old| old.first().and_then(|cell| cell.as_deref()) == Some(table) && old.get(1..3) == row.get(..2)))).collect()
     }
     pub fn columns(&self, profile: &Profile, schema: &str, table: &str) -> Vec<String> {
@@ -93,8 +95,7 @@ impl MetadataCache {
     }
     pub fn get(&self, profile: &Profile, sql: &str) -> Option<Vec<Cells>> {
         let entry = self.entries.get(&key(profile, sql))?;
-        let columns = sql.contains("FROM pg_catalog.pg_attribute") || sql.contains("FROM svv_all_columns");
-        (entry.day != 0 && (!columns || entry.day == today())).then(|| entry.rows.clone())
+        (entry.day != 0).then(|| entry.rows.clone())
     }
     pub fn insert(&mut self, profile: &Profile, sql: &str, rows: &[Cells]) {
         let previous = self.entries.get(&key(profile, sql)).map(|entry| entry.rows.clone());
@@ -108,13 +109,6 @@ impl MetadataCache {
                 previous,
             },
         );
-        self.save();
-    }
-    pub fn invalidate(&mut self, profile: &Profile) {
-        let connection = connection(profile);
-        for entry in self.entries.values_mut().filter(|entry| entry.connection == connection) {
-            entry.day = 0;
-        }
         self.save();
     }
     pub fn invalidate_scope(&mut self, profile: &Profile, schema: &str) -> Vec<String> {
@@ -138,6 +132,16 @@ impl MetadataCache {
     }
     pub fn changed_tables(&self, profile: &Profile, schema: &str, objects: &[crate::DbObject]) -> Vec<String> {
         let mut changed = Vec::new();
+        if let Some(scope) = load_scope(profile, schema) {
+            if let Some(previous) = &scope.previous_fields {
+                for object in objects {
+                    let current = scope.fields.iter().filter(|row| row.first().and_then(|cell| cell.as_deref()) == Some(object.name.as_str())).map(|row| row.get(1..3));
+                    let old = previous.iter().filter(|row| row.first().and_then(|cell| cell.as_deref()) == Some(object.name.as_str())).map(|row| row.get(1..3));
+                    if !current.eq(old) { changed.push(object.name.to_string()); }
+                }
+            }
+            return changed;
+        }
         if let Some(entry) = self.entries.get(&key(profile, &crate::db::columns_sql(schema, None, profile.redshift))) {
             if let Some(previous) = &entry.previous {
                 for object in objects {
@@ -264,4 +268,51 @@ mod tests {
         cache.entries.get_mut(&key(&profile, sql)).unwrap().day = 0;
         assert!(cache.get(&profile, sql).is_none());
     }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ScopeObject {
+    pub schema_name: String,
+    pub object_name: String,
+    pub kind: String,
+}
+#[derive(Deserialize, Serialize)]
+pub struct ScopeMetadata {
+    identity: serde_json::Value,
+    pub objects: Vec<ScopeObject>,
+    pub fields: Vec<Cells>,
+    #[serde(default)]
+    previous_fields: Option<Vec<Cells>>,
+    fetched: u64,
+}
+fn scope_identity(profile: &Profile, schema: &str) -> serde_json::Value {
+    serde_json::json!([profile.redshift, profile.host, profile.port, profile.user, profile.database, schema])
+}
+fn scope_path(profile: &Profile, schema: &str) -> Option<PathBuf> {
+    let identity = serde_json::to_vec(&scope_identity(profile, schema)).ok()?;
+    let hash = identity.iter().fold(14695981039346656037u64, |hash, byte| (hash ^ *byte as u64).wrapping_mul(1099511628211));
+    Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("MyDataTools/metadata").join(format!("{hash:016x}.json")))
+}
+pub fn load_scope(profile: &Profile, schema: &str) -> Option<ScopeMetadata> {
+    let path = scope_path(profile, schema)?;
+    if fs::metadata(&path).ok()?.len() > 64 * 1024 * 1024 { return None; }
+    let scope: ScopeMetadata = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    (scope.identity == scope_identity(profile, schema) && scope.fields.iter().all(|row| row.len() == 6) && scope.objects.iter().all(|object| object.schema_name == schema && matches!(object.kind.as_str(), "table" | "view" | "materialized_view"))).then_some(scope)
+}
+pub fn lock_scope(profile: &Profile, schema: &str) -> Result<fs::File, String> {
+    let path = scope_path(profile, schema).ok_or("LOCALAPPDATA unavailable")?;
+    fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    let lock = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path.with_extension("lock")).map_err(|e| e.to_string())?;
+    lock.lock().map_err(|e| e.to_string())?;
+    Ok(lock)
+}
+pub fn save_scope(profile: &Profile, schema: &str, objects: &[crate::DbObject], fields: Vec<Cells>) -> Result<(), String> {
+    let path = scope_path(profile, schema).ok_or("LOCALAPPDATA unavailable")?;
+    let previous_fields = load_scope(profile, schema).map(|scope| scope.fields);
+    let scope = ScopeMetadata { identity: scope_identity(profile, schema), objects: objects.iter().map(|object| ScopeObject { schema_name: schema.into(), object_name: object.name.to_string(), kind: match object.kind { 1 => "view", 2 => "materialized_view", _ => "table" }.into() }).collect(), fields, previous_fields, fetched: now() };
+    let mut temp = tempfile::NamedTempFile::new_in(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    temp.write_all(&serde_json::to_vec(&scope).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    temp.persist(path).map_err(|e| e.to_string())?;
+    Ok(())
 }

@@ -24,6 +24,7 @@ export component ActionButton inherits Rectangle {
 }
 
 export component PopupRow inherits Rectangle {
+    in property <image> icon;
     in property <string> text;
     in property <bool> enabled: true;
     in property <bool> selected;
@@ -35,6 +36,7 @@ export component PopupRow inherits Rectangle {
     background: root.enabled && root.selected ? Theme.selected : root.enabled && touch.has-hover ? Theme.hover : Theme.surface;
     accessible-role: list-item; accessible-label: root.text; accessible-enabled: root.enabled;
     accessible-action-default => { if root.enabled { root.activated(); } }
+    Image { x: 5px; y: (parent.height - 16px) / 2; width: 16px; height: 16px; source: root.icon; colorize: Theme.text; opacity: root.enabled ? 1 : 0.4; }
     if root.checked: Path {
         x: 7px; y: (parent.height - 12px) / 2; width: 12px; height: 12px;
         viewbox-width: 12; viewbox-height: 12; stroke: Theme.text; stroke-width: 1.5px; fill: transparent;
@@ -44,7 +46,7 @@ export component PopupRow inherits Rectangle {
     touch := TouchArea { enabled: root.enabled; moved => { root.hovered(); } clicked => { root.activated(); } }
 }
 
-export struct PopupAction { text: string, enabled: bool, checked: bool }
+export struct PopupAction { text: string, enabled: bool, checked: bool, icon: image }
 
 export component PopupMenu inherits TouchArea {
     in property <[PopupAction]> actions;
@@ -78,7 +80,7 @@ export component PopupMenu inherits TouchArea {
                 VerticalBox {
                     padding: Theme.popup-padding; spacing: 0px;
                     for action[index] in root.actions: PopupRow {
-                        text: action.text; enabled: action.enabled; checked: action.checked; selected: root.highlighted == index;
+                        icon: action.icon; text: action.text; enabled: action.enabled; checked: action.checked; selected: root.highlighted == index;
                         hovered => { root.highlighted = index; }
                         activated => { root.choose(index); }
                     }

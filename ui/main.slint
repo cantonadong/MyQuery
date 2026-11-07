@@ -363,9 +363,8 @@ export component AppWindow inherits Window {
                     ObjectTab { text: I18n.t("表", "Table"); tab-style: true; selected: root.object-kind == 0; clicked => { root.object-kind = 0; root.filter-objects(); } }
                     ObjectTab { text: I18n.t("视图", "View"); tab-style: true; selected: root.object-kind == 1; clicked => { root.object-kind = 1; root.filter-objects(); } }
                     ObjectTab { text: I18n.t("物化视图", "MView"); tab-style: true; selected: root.object-kind == 2; clicked => { root.object-kind = 2; root.filter-objects(); } }
-                    IconButton { width: 24px; height: 24px; icon: @image-url("icons/refresh.svg"); accessible-label: I18n.t("刷新", "Refresh"); enabled: root.connected && !root.busy && !root.queries-running; clicked => { root.action("refresh"); } Tooltip { text: @markdown("\{I18n.t("刷新", "Refresh")}"); } }
                     IconButton {
-                        width: 24px; height: 24px; icon: @image-url("icons/refresh-all.svg");
+                        width: 24px; height: 24px; icon: @image-url("icons/refresh.svg");
                         accessible-label: I18n.t("刷新全部", "Refresh all");
                         enabled: root.connected && root.schema != "" && !root.busy && !root.queries-running;
                         clicked => { root.action("refresh-schema"); }
@@ -380,17 +379,17 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
                     min-height: 100px;
                     actions: [
-                        { text: I18n.t("复制表结构", "Copy table structure"), enabled: !root.busy && root.table-index >= 0, checked: false },
-                        { text: root.show-hidden ? I18n.t("恢复显示", "Restore visibility") : I18n.t("隐藏", "Hide"), enabled: !root.busy && root.table-index >= 0, checked: false },
-                        { text: I18n.t("复制表名", "Copy object name"), enabled: !root.busy && root.table-index >= 0, checked: false },
-                        { text: I18n.t("快速 LIMIT 10", "Quick LIMIT 10"), enabled: !root.show-hidden && !root.busy && root.table-index >= 0, checked: false },
-                        { text: I18n.t("快速 GROUP BY…", "Quick GROUP BY…"), enabled: !root.show-hidden && !root.busy && root.table-index >= 0, checked: false }
+                        { text: I18n.t("复制表名", "Copy object name"), enabled: !root.busy && root.table-index >= 0, checked: false, icon: @image-url("icons/copy.svg") },
+                        { text: I18n.t("复制表结构", "Copy table structure"), enabled: !root.busy && root.table-index >= 0, checked: false, icon: @image-url("icons/table-structure.svg") },
+                        { text: root.show-hidden ? I18n.t("恢复显示", "Restore visibility") : I18n.t("隐藏", "Hide"), enabled: !root.busy && root.table-index >= 0, checked: false, icon: @image-url("icons/visibility.svg") },
+                        { text: I18n.t("快速 LIMIT 10", "Quick LIMIT 10"), enabled: !root.show-hidden && !root.busy && root.table-index >= 0, checked: false, icon: @image-url("icons/limit.svg") },
+                        { text: I18n.t("快速 GROUP BY…", "Quick GROUP BY…"), enabled: !root.show-hidden && !root.busy && root.table-index >= 0, checked: false, icon: @image-url("icons/group.svg") }
                     ];
-                    activated(choice) => { if choice == 0 { root.action("copy-structure"); } else if choice == 1 { root.action(root.show-hidden ? "restore-object" : "hide-object"); } else if choice == 2 { root.action("copy-table"); } else if choice == 3 { root.action("quick-limit"); } else if choice == 4 { root.action("quick-group"); } }
+                    activated(choice) => { if choice == 0 { root.action("copy-table"); } else if choice == 1 { root.action("copy-structure"); } else if choice == 2 { root.action(root.show-hidden ? "restore-object" : "hide-object"); } else if choice == 3 { root.action("quick-limit"); } else if choice == 4 { root.action("quick-group"); } }
                     DenseList {
                         visible: root.browser-refresh == 0;
                         model: root.tables; highlighted: root.table-changes;
-                        enabled: !root.busy || root.fields-loading;
+                        enabled: !root.busy;
                         current-item <=> root.table-index;
                         current-item-changed(index) => { root.table-selected(index); }
                         item-double-clicked(index) => { root.action("copy-table"); }
@@ -402,7 +401,7 @@ export component AppWindow inherits Window {
                             x: 0px; y: (parent.height - 24px) / 2; width: 100%; height: 24px;
                             spacing: 6px; alignment: center;
                             LoadingIndicator {}
-                            Caption { height: 24px; horizontal-stretch: 0; text: root.browser-refresh == 2 ? I18n.t("正在刷新表和字段…", "Refreshing tables and columns…") : I18n.t("正在刷新…", "Refreshing…"); }
+                            Caption { height: 24px; horizontal-stretch: 0; text: root.browser-refresh == 3 ? I18n.t("加载中", "Loading") : root.browser-refresh == 2 ? I18n.t("正在刷新表和字段…", "Refreshing tables and columns…") : I18n.t("正在刷新…", "Refreshing…"); }
                         }
                     }
                 }
@@ -743,10 +742,14 @@ export component AppWindow inherits Window {
                             padding: 2px; spacing: 4px;
                             Rectangle { horizontal-stretch: 1; }
                             Rectangle {
-                                width: connection-state.preferred-width + 14px; horizontal-stretch: 0;
-                                Rectangle { x: 0px; y: (parent.height - 8px) / 2; width: 8px; height: 8px; border-radius: Theme.control-radius; background: root.connected ? #26985c : #d74747; }
-                                connection-state := Caption { x: 14px; width: self.preferred-width; height: parent.height; text: root.reconnecting ? I18n.t("正在重连…", "Reconnecting…") : root.connected ? I18n.t("已连接", "Connected") : I18n.t("未连接，点击重连", "Disconnected, click to reconnect"); }
-                                TouchArea { enabled: !root.connected && !root.reconnecting && !root.busy; mouse-cursor: pointer; clicked => { root.action("reconnect"); } }
+                                width: connection-state.preferred-width + 22px; horizontal-stretch: 0;
+                                border-radius: Theme.control-radius;
+                                border-width: 1px;
+                                border-color: reconnect-touch.enabled && reconnect-touch.has-hover ? Theme.border : transparent;
+                                background: reconnect-touch.enabled && reconnect-touch.pressed ? Theme.selected : reconnect-touch.enabled && reconnect-touch.has-hover ? Theme.hover : transparent;
+                                Rectangle { x: 4px; y: (parent.height - 8px) / 2; width: 8px; height: 8px; border-radius: Theme.control-radius; background: root.reconnecting ? #c48a18 : root.connected ? #26985c : #d74747; }
+                                connection-state := Caption { x: 18px; width: self.preferred-width; height: parent.height; text: root.reconnecting ? I18n.t("正在连接", "Connecting") : root.connected ? I18n.t("已连接", "Connected") : I18n.t("未连接，点击重连", "Disconnected, click to reconnect"); }
+                                reconnect-touch := TouchArea { enabled: !root.connected && !root.reconnecting && !root.busy; mouse-cursor: pointer; clicked => { root.action("reconnect"); } }
                             }
                         }
                     }
