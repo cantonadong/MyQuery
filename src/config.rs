@@ -3,6 +3,10 @@ use std::{collections::BTreeMap, fs, io::Write, path::PathBuf};
 
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Profile {
+    #[serde(default)]
+    pub shared_id: String,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
     pub name: String,
     pub redshift: bool,
     pub host: String,
@@ -16,6 +20,10 @@ pub struct Profile {
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Settings {
+    #[serde(skip)]
+    baseline: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
     pub profiles: Vec<Profile>,
     pub language: Option<String>,
     #[serde(default)]
@@ -68,11 +76,16 @@ impl Settings {
 
 fn path() -> Result<PathBuf, String> {
     let root = std::env::var_os("APPDATA").ok_or("APPDATA unavailable")?;
-    Ok(PathBuf::from(root).join("SqlDesk").join("connections.json"))
+    Ok(PathBuf::from(root).join("MyDataTools").join("connections.json"))
 }
 
 pub fn load() -> Result<Settings, String> {
     let path = path()?;
+    let _lock = config_lock()?;
+    if !path.exists() {
+        let legacy = PathBuf::from(std::env::var_os("APPDATA").ok_or("APPDATA unavailable")?).join("SqlDesk/connections.json");
+        if legacy.exists() { fs::copy(legacy, &path).map_err(|e| e.to_string())?; }
+    }
     if !path.exists() {
         return Ok(Settings::default());
     }
@@ -89,11 +102,53 @@ pub fn load() -> Result<Settings, String> {
             });
         }
     }
+    *settings.baseline.lock().unwrap() = serde_json::to_value(&settings).map_err(|e| e.to_string())?;
     Ok(settings)
 }
 
+fn config_lock() -> Result<fs::File, String> {
+    let path = path()?.with_extension("lock");
+    fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).map_err(|e| e.to_string())?;
+    file.lock().map_err(|e| e.to_string())?;
+    Ok(file)
+}
+
 pub fn save(settings: &Settings) -> Result<(), String> {
-    let data = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
+    let _lock = config_lock()?;
+    let current = serde_json::to_value(settings).map_err(|e| e.to_string())?;
+    let mut baseline = settings.baseline.lock().unwrap();
+    let mut merged: serde_json::Value = if path()?.exists() { serde_json::from_slice(&fs::read(path()?).map_err(|e| e.to_string())?).map_err(|e| e.to_string())? } else { serde_json::json!({}) };
+    for (key, value) in current.as_object().unwrap() {
+        if baseline.get(key) == Some(value) { continue; }
+        if key == "profiles" || key == "browser_scopes" {
+            let old = baseline.get(key).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let incoming = value.as_array().unwrap();
+            let saved = merged.as_object_mut().ok_or("Invalid shared configuration")?.entry(key.clone()).or_insert(serde_json::json!([]));
+            let saved = saved.as_array_mut().ok_or("Invalid shared collection")?;
+            let identity = |v: &serde_json::Value| if key == "profiles" { v["name"].to_string() } else { v.to_string() };
+            for prior in &old {
+                if !incoming.iter().any(|v| identity(v) == identity(prior)) { saved.retain(|v| identity(v) != identity(prior)); }
+            }
+            for item in incoming {
+                let prior = old.iter().find(|v| identity(v) == identity(item));
+                if prior == Some(item) { continue; }
+                if let Some(existing) = saved.iter_mut().find(|v| identity(v) == identity(item)) {
+                    if key == "profiles" {
+                        for (field, field_value) in item.as_object().unwrap() {
+                            if prior.and_then(|v| v.get(field)) != Some(field_value) { existing[field] = field_value.clone(); }
+                        }
+                    } else { *existing = item.clone(); }
+                } else { saved.push(item.clone()); }
+            }
+        } else { merged[key] = value.clone(); }
+    }
+    if let Some(old) = baseline.as_object() {
+        for key in old.keys().filter(|key| !current.as_object().unwrap().contains_key(*key)) {
+            merged.as_object_mut().ok_or("Invalid shared configuration")?.remove(key);
+        }
+    }
+    let data = serde_json::to_vec_pretty(&merged).map_err(|e| e.to_string())?;
     if data.len() > 1024 * 1024 {
         return Err("Connection configuration exceeds 1 MiB".into());
     }
@@ -105,6 +160,7 @@ pub fn save(settings: &Settings) -> Result<(), String> {
     temp.flush().map_err(|e| e.to_string())?;
     temp.as_file().sync_all().map_err(|e| e.to_string())?;
     temp.persist(path).map_err(|e| e.to_string())?;
+    *baseline = current;
     Ok(())
 }
 
@@ -157,11 +213,9 @@ fn delete_legacy_password(name: &str) -> Result<(), String> {
 }
 
 fn password_path() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    Ok(exe
-        .parent()
-        .ok_or("Executable directory unavailable")?
-        .join("passwords.dat"))
+    let path = path()?.with_file_name("passwords.dat");
+    fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    Ok(path)
 }
 
 fn password_lock() -> Result<fs::File, String> {
@@ -181,15 +235,23 @@ fn password_lock() -> Result<fs::File, String> {
 
 fn passwords() -> Result<BTreeMap<String, String>, String> {
     let path = password_path()?;
-    if !path.exists() {
-        return Ok(BTreeMap::new());
+    let read = |path: &PathBuf| -> Result<BTreeMap<String, String>, String> {
+        if !path.exists() { return Ok(BTreeMap::new()); }
+        if fs::metadata(path).map_err(|e| e.to_string())?.len() > 1024 * 1024 { return Err("Encrypted password file exceeds 1 MiB".into()); }
+        let encrypted = fs::read(path).map_err(|e| e.to_string())?;
+        serde_json::from_slice(&protect(&encrypted, false)?).map_err(|e| e.to_string())
+    };
+    let mut stored = read(&path)?;
+    let marker = path.with_file_name("myquery-passwords-migrated");
+    if !marker.exists() {
+        let legacy = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("passwords.dat");
+        if legacy != path {
+            for (name, password) in read(&legacy)? { stored.entry(name).or_insert(password); }
+            if legacy.exists() { save_passwords(&stored)?; }
+        }
+        fs::write(marker, b"1").map_err(|e| e.to_string())?;
     }
-    if fs::metadata(&path).map_err(|e| e.to_string())?.len() > 1024 * 1024 {
-        return Err("Encrypted password file exceeds 1 MiB".into());
-    }
-    let encrypted = fs::read(path).map_err(|e| e.to_string())?;
-    let plain = protect(&encrypted, false)?;
-    serde_json::from_slice(&plain).map_err(|e| e.to_string())
+    Ok(stored)
 }
 
 fn save_passwords(passwords: &BTreeMap<String, String>) -> Result<(), String> {
