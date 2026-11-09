@@ -24,6 +24,7 @@ export component SqlEditor inherits Rectangle {
     callback highlight(string);
     callback complete(string, int) -> [string];
     callback insert-completion(string, int, string) -> SqlCompletion;
+    callback pair-quote(string, int, int, string) -> SqlCompletion;
     private property <[string]> suggestions;
     private property <int> suggestion-index;
     private property <int> completion-offset;
@@ -121,6 +122,12 @@ export component SqlEditor inherits Rectangle {
                 page-height: scroll.visible-height;
                 edited => { root.highlight(root.text); root.completion-pending = true; }
                 key-pressed(event) => {
+                    if !root.read-only && !event.modifiers.control && !event.modifiers.alt && (event.text == "'" || event.text == "\"") {
+                        let edit = root.pair-quote(root.text, input.anchor-position-byte-offset, input.cursor-position-byte-offset, event.text);
+                        input.text = edit.text;
+                        input.set-selection-offsets(edit.offset, edit.offset);
+                        return accept;
+                    }
                     if event.modifiers.control && event.text == Key.Space { root.refresh-completion(); return accept; }
                     if root.suggestions.length > 0 {
                         if event.text == Key.DownArrow { root.suggestion-index = mod(root.suggestion-index + 1, root.suggestions.length); return accept; }

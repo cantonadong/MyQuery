@@ -125,6 +125,7 @@ export component FadeScrollBar inherits Rectangle {
 }
 
 export component DenseList inherits Rectangle {
+    in property <length> text-padding: 5px;
     in property <bool> enabled: true;
     in property <[StandardListViewItem]> model;
     in property <[bool]> highlighted;
@@ -165,7 +166,7 @@ export component DenseList inherits Rectangle {
                 accessible-label: item.text;
                 accessible-item-selected: root.current-item == index;
                 accessible-action-default => { root.select(index); }
-                Text { x: 5px; width: parent.width - 10px; height: parent.height; text: item.text; font-size: 12px; color: root.highlighted[index] ? Theme.focus : Theme.text; vertical-alignment: center; overflow: elide; }
+                Text { x: root.text-padding; width: parent.width - 2 * root.text-padding; height: parent.height; text: item.text; font-size: 12px; color: root.highlighted[index] ? Theme.focus : Theme.text; vertical-alignment: center; overflow: elide; }
                 touch := TouchArea {
                     enabled: root.enabled;
                     clicked => { keys.focus(); root.select(index); }

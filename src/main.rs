@@ -1975,7 +1975,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match result {
                         Ok(()) => {
                             let message = tr(ui.global::<I18n>().get_zh(), "已复制表名", "Object name copied");
-                            ui.invoke_notify(message.into());
+                            ui.invoke_notify(format!("{message}: {}", table.text).into());
                         }
                         Err(error) => { ui.set_failed(true); ui.set_status(error.to_string().into()); }
                     }
@@ -2184,6 +2184,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         strings(suggestions)
     });
     ui.on_insert_completion(|sql, offset, value| completion::insert(&sql, offset.max(0) as usize, &value));
+    ui.on_pair_quote(|sql, anchor, cursor, quote| {
+        let start = anchor.min(cursor).max(0) as usize;
+        let end = anchor.max(cursor).max(0) as usize;
+        SqlCompletion {
+            text: format!("{}{quote}{}{quote}{}", &sql[..start], &sql[start..end], &sql[end..]).into(),
+            offset: (start + 1) as i32,
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_copy_text(move |text, show_name| {
+        let Some(ui) = weak.upgrade() else { return; };
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string())) {
+            Ok(()) => {
+                let message = tr(ui.global::<I18n>().get_zh(), "已复制", "Copied");
+                ui.invoke_notify(if show_name { format!("{message}: {text}").into() } else { message.into() });
+            }
+            Err(error) => { ui.set_failed(true); ui.set_status(error.to_string().into()); }
+        }
+    });
     ui.on_localize_error(|error, zh| explain(zh, error.to_string()).into());
     let weak = ui.as_weak();
     let sender = tx.clone();
