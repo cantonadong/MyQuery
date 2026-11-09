@@ -173,6 +173,8 @@ export component AppWindow inherits Window {
     callback highlight(string);
     callback complete-sql(string, int) -> [string];
     callback insert-completion(string, int, string) -> SqlCompletion;
+    callback pair-quote(string, int, int, string) -> SqlCompletion;
+    callback copy-text(string, bool);
     in-out property <[SqlTab]> sql-tabs;
     in-out property <int> active-sql;
     private property <length> sql-tab-drag-x: -1px;
@@ -336,7 +338,7 @@ export component AppWindow inherits Window {
             clip: true;
             background: Theme.panel;
             sidebar-layout := VerticalBox {
-                padding: 4px;
+                padding: 4px; padding-left: 1px; padding-right: 1px;
                 spacing: Theme.control-gap;
                 browser-area := VerticalBox {
                 padding: 0px; spacing: Theme.control-gap;
@@ -372,7 +374,25 @@ export component AppWindow inherits Window {
                     }
                 }
                 HorizontalBox { padding: 0px; spacing: Theme.control-gap;
-                    LineEdit { height: 24px; text <=> root.object-search; placeholder-text: I18n.t("搜索表、视图及已加载字段", "Search objects and loaded columns"); edited => { root.filter-objects(); } }
+                    Rectangle {
+                        height: 24px; horizontal-stretch: 1;
+                        background: Theme.surface; border-width: 1px; border-radius: Theme.control-radius;
+                        border-color: object-search-input.has-focus ? Theme.focus : Theme.border;
+                        forward-focus: object-search-input;
+                        Text { x: 3px; width: parent.width - 6px; height: 100%; visible: root.object-search == ""; text: I18n.t("搜索表、视图及已加载字段", "Search objects and loaded columns"); color: Theme.muted; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                        object-search-input := TextInput {
+                            x: 3px; width: parent.width - (root.object-search == "" ? 6px : 28px); height: 100%;
+                            text <=> root.object-search; single-line: true; font-size: 12px; color: Theme.text; vertical-alignment: center;
+                            accessible-label: I18n.t("搜索表、视图及已加载字段", "Search objects and loaded columns");
+                            selection-background-color: Theme.selection; selection-foreground-color: white;
+                            edited => { root.filter-objects(); }
+                        }
+                        if root.object-search != "": IconButton {
+                            x: parent.width - 23px; y: 1px; width: 22px; height: 22px; subtle: true; destructive: true;
+                            icon: @image-url("icons/close.svg"); accessible-label: I18n.t("清空搜索", "Clear search");
+                            clicked => { root.object-search = ""; root.filter-objects(); object-search-input.focus(); }
+                        }
+                    }
                     IconButton { width: 24px; height: 24px; icon: @image-url("icons/add.svg"); accessible-label: I18n.t("添加", "Add"); enabled: root.connected && root.object-search != "" && !root.busy; clicked => { root.action("add-prefix"); } Tooltip { text: @markdown("\{I18n.t("添加", "Add")}"); } }
                 }
                 object-menu := PopupMenu {
@@ -387,6 +407,7 @@ export component AppWindow inherits Window {
                     ];
                     activated(choice) => { if choice == 0 { root.action("copy-table"); } else if choice == 1 { root.action("copy-structure"); } else if choice == 2 { root.action(root.show-hidden ? "restore-object" : "hide-object"); } else if choice == 3 { root.action("quick-limit"); } else if choice == 4 { root.action("quick-group"); } }
                     DenseList {
+                        text-padding: 2px;
                         visible: root.browser-refresh == 0;
                         model: root.tables; highlighted: root.table-changes;
                         enabled: !root.busy;
@@ -454,6 +475,7 @@ export component AppWindow inherits Window {
                             accessible-role: list-item; accessible-label: field.name + ", " + field.datatype;
                             Text { x: 5px; width: parent.width * 0.6 - 10px; height: parent.height; text: field.name; color: field.added ? Theme.focus : Theme.text; vertical-alignment: center; overflow: elide; }
                             Text { x: parent.width * 0.6 + 5px; width: parent.width * 0.4 - 10px; height: parent.height; text: field.datatype; color: field.added ? Theme.focus : Theme.muted; vertical-alignment: center; overflow: elide; }
+                            TouchArea { double-clicked => { root.copy-text(field.name, true); } }
                         }
                     }
                         FadeScrollBar { x: parent.width - self.width; height: parent.height; content-height: field-list.content-height; value <=> field-list.content-y; }
@@ -602,12 +624,13 @@ export component AppWindow inherits Window {
                             IconButton { height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/search.svg"); accessible-label: I18n.t("查找", "Find") + " (Ctrl+F)"; clicked => { sql-editor.open-find(); } Tooltip { text: @markdown("\{I18n.t("查找", "Find")} (Ctrl+F)"); } }
                             IconButton { height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/import.svg"); accessible-label: I18n.t("导入", "Import"); enabled: !root.busy; clicked => { root.action("import"); } Tooltip { text: @markdown("\{I18n.t("导入", "Import")}"); } }
                             IconButton { height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/export.svg"); accessible-label: I18n.t("导出", "Export"); enabled: !root.busy; clicked => { root.action("save-sql"); } Tooltip { text: @markdown("\{I18n.t("导出", "Export")}"); } }
+                            IconButton { height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/copy.svg"); accessible-label: I18n.t("复制全部 SQL", "Copy all SQL"); enabled: root.sql != ""; clicked => { root.copy-text(root.sql, false); } Tooltip { text: @markdown("\{I18n.t("复制全部 SQL", "Copy all SQL")}"); } }
                         }
                     }
                     editor-pane := VerticalLayout {
                         horizontal-stretch: 1;
                         min-height: 0px;
-                        sql-editor := SqlEditor { completion-revision: root.completion-revision; insert-completion(code, offset, value) => { return root.insert-completion(code, offset, value); } complete(code, offset) => { return root.complete-sql(code, offset); } save => { if !root.busy && !root.save-prompt-open { root.action("save-document"); } } find(needle, current, backward) => { return root.find-sql(needle, current, backward); } text <=> root.sql; read-only: root.query-running || root.save-prompt-open; zh: I18n.zh; lines: root.sql-lines; highlighted-source: root.highlighted-sql; highlight(code) => { root.highlight(code); } }
+                        sql-editor := SqlEditor { pair-quote(code, anchor, cursor, quote) => { return root.pair-quote(code, anchor, cursor, quote); } completion-revision: root.completion-revision; insert-completion(code, offset, value) => { return root.insert-completion(code, offset, value); } complete(code, offset) => { return root.complete-sql(code, offset); } save => { if !root.busy && !root.save-prompt-open { root.action("save-document"); } } find(needle, current, backward) => { return root.find-sql(needle, current, backward); } text <=> root.sql; read-only: root.query-running || root.save-prompt-open; zh: I18n.zh; lines: root.sql-lines; highlighted-source: root.highlighted-sql; highlight(code) => { root.highlight(code); } }
                     }
                 }
                     }
