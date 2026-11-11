@@ -177,7 +177,11 @@ pub async fn metadata(client: &Client, sql: &str) -> Result<Vec<Cells>, QueryFai
     Ok(rows)
 }
 
-pub async fn execute(client: &Client, sql: &str, mut progress: impl FnMut(usize)) -> Result<(Vec<ResultSet>, u64), QueryFailure> {
+pub async fn execute(client: &Client, sql: &str, progress: impl FnMut(usize)) -> Result<(Vec<ResultSet>, u64), QueryFailure> {
+    execute_limited(client, sql, progress, usize::MAX, MAX_BYTES).await
+}
+
+pub async fn execute_limited(client: &Client, sql: &str, mut progress: impl FnMut(usize), max_rows: usize, max_bytes: u64) -> Result<(Vec<ResultSet>, u64), QueryFailure> {
     let stream = client.simple_query_raw(sql).await.map_err(query_error)?;
     pin_mut!(stream);
     let mut sets: Vec<ResultSet> = Vec::new();
@@ -199,6 +203,7 @@ pub async fn execute(client: &Client, sql: &str, mut progress: impl FnMut(usize)
                 )?);
             }
             SimpleQueryMessage::Row(row) => {
+                if received >= max_rows { return Err("LIMIT_ROWS".into()); }
                 if (0..row.len())
                     .map(|i| row.get(i).map_or(0, str::len))
                     .sum::<usize>()
@@ -213,7 +218,7 @@ pub async fn execute(client: &Client, sql: &str, mut progress: impl FnMut(usize)
                     .last_mut()
                     .ok_or("Missing result header")?
                     .push(cells)?;
-                if bytes > MAX_BYTES {
+                if bytes > max_bytes {
                     return Err("LIMIT_RESULT".into());
                 }
                 received += 1;
@@ -230,7 +235,7 @@ pub async fn execute(client: &Client, sql: &str, mut progress: impl FnMut(usize)
                     let mut set = ResultSet::new(vec!["Status".into(), "Affected rows".into()])?;
                     set.status = true;
                     bytes += set.push(vec![Some("Success".into()), Some(count.to_string())])?;
-                    if bytes > MAX_BYTES { return Err("LIMIT_RESULT".into()); }
+                    if bytes > max_bytes { return Err("LIMIT_RESULT".into()); }
                     set
                 };
                 set.finish()?;
