@@ -129,6 +129,11 @@ export component DenseList inherits Rectangle {
     in property <bool> enabled: true;
     in property <[StandardListViewItem]> model;
     in property <[bool]> highlighted;
+    in property <bool> multi-select;
+    in property <[bool]> selected-items;
+    callback selection-changed(int, bool, bool);
+    callback select-all();
+    callback copy-selection();
     in-out property <int> current-item: -1;
     callback current-item-changed(int);
     callback item-double-clicked(int);
@@ -150,10 +155,13 @@ export component DenseList inherits Rectangle {
         enabled: root.enabled;
         accessible-role: AccessibleRole.list;
         key-pressed(event) => {
-            if event.text == Key.UpArrow { root.select(root.current-item - 1); return accept; }
-            if event.text == Key.DownArrow { root.select(root.current-item + 1); return accept; }
-            if event.text == Key.Home { root.select(0); return accept; }
-            if event.text == Key.End { root.select(root.model.length - 1); return accept; }
+            if root.multi-select && event.modifiers.control && (event.text == "a" || event.text == "A") { root.select-all(); return accept; }
+            if root.multi-select && event.modifiers.control && (event.text == "c" || event.text == "C") { root.copy-selection(); return accept; }
+            if event.text == Key.UpArrow || event.text == Key.DownArrow || event.text == Key.Home || event.text == Key.End {
+                root.select(event.text == Key.Home ? 0 : event.text == Key.End ? root.model.length - 1 : root.current-item + (event.text == Key.UpArrow ? -1 : 1));
+                if root.multi-select && root.model.length > 0 { root.selection-changed(root.current-item, event.modifiers.shift, event.modifiers.control); }
+                return accept;
+            }
             return reject;
         }
         list := ListView {
@@ -161,17 +169,26 @@ export component DenseList inherits Rectangle {
             horizontal-scrollbar-policy: always-off;
             for item[index] in root.model: Rectangle {
                 height: 22px;
-                background: root.current-item == index ? Theme.selected : touch.has-hover ? Theme.panel : Theme.surface;
+                background: (root.multi-select ? root.selected-items[index] : root.current-item == index) ? Theme.selected : touch.has-hover ? Theme.panel : Theme.surface;
                 accessible-role: list-item;
                 accessible-label: item.text;
-                accessible-item-selected: root.current-item == index;
-                accessible-action-default => { root.select(index); }
+                accessible-item-selected: root.multi-select ? root.selected-items[index] : root.current-item == index;
+                accessible-action-default => { root.select(index); if root.multi-select { root.selection-changed(index, false, false); } }
                 Text { x: root.text-padding; width: parent.width - 2 * root.text-padding; height: parent.height; text: item.text; font-size: 12px; color: root.highlighted[index] ? Theme.focus : Theme.text; vertical-alignment: center; overflow: elide; }
                 touch := TouchArea {
                     enabled: root.enabled;
-                    clicked => { keys.focus(); root.select(index); }
-                    double-clicked => { keys.focus(); root.select(index); root.item-double-clicked(index); }
-                    pointer-event(event) => { root.item-pointer-event(index, event, { x: self.mouse-x, y: self.mouse-y + index * 22px + list.content-y }); }
+                    clicked => { if !root.multi-select { keys.focus(); root.select(index); } }
+                    double-clicked => { keys.focus(); if !root.multi-select { root.select(index); } root.item-double-clicked(index); }
+                    pointer-event(event) => {
+                        if root.multi-select && event.kind == PointerEventKind.down {
+                            keys.focus();
+                            if event.button == PointerEventButton.left || (event.button == PointerEventButton.right && !root.selected-items[index]) {
+                                root.selection-changed(index, event.button == PointerEventButton.left && event.modifiers.shift, event.button == PointerEventButton.left && event.modifiers.control);
+                                if !event.modifiers.shift && !event.modifiers.control { root.select(index); } else { root.current-item = index; }
+                            }
+                        }
+                        root.item-pointer-event(index, event, { x: self.mouse-x, y: self.mouse-y + index * 22px + list.content-y });
+                    }
                 }
             }
         }
@@ -195,6 +212,7 @@ export component DenseTable inherits Rectangle {
     private property <int> current-column: -1;
     callback row-selected(int, bool, bool);
     callback cell-selected(int, int, bool, bool);
+    callback cell-double-clicked(int, int);
     callback column-at(float) -> int;
     callback column-selected(int, bool);
     callback select-all();
@@ -340,6 +358,7 @@ export component DenseTable inherits Rectangle {
                             accessible-item-selected: root.selected-cells[index * root.columns.length + column] || root.selected-rows[index];
                             Text { x: 5px; width: parent.width - 10px; height: parent.height; text: cell.text; font-size: 12px; color: Theme.text; vertical-alignment: center; overflow: elide; }
                             TouchArea {
+                                double-clicked => { root.cell-double-clicked(index, column); }
                                 moved => {
                                     if self.pressed && root.multi-select {
                                         let x = parent.x + self.mouse-x + list.content-x;

@@ -2,13 +2,11 @@
 
 mod cache;
 mod completion;
-mod config;
-mod db;
 mod documents;
 mod dialogs;
-mod results;
 mod syntax;
 
+use myquery_core::{config, db, results};
 use config::{Profile, Settings};
 use results::{Cells, PAGE_SIZE, ResultSet};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, StandardListViewItem, TableColumn, VecModel};
@@ -185,8 +183,8 @@ fn filter_objects(ui: &AppWindow) {
 fn filter_group(ui: &AppWindow) {
     use slint::Model;
     let search = ui.get_group_search().to_lowercase();
-    ui.set_group_fields(items(ui.get_field_names().iter().filter(|name| name.to_lowercase().contains(&search)).map(|name| name.to_string()).collect()));
-    ui.set_group_field("".into());
+    let selected: Vec<_> = ui.get_group_selected().iter().map(|item| item.text).collect();
+    ui.set_group_fields(items(ui.get_field_names().iter().filter(|name| name.to_lowercase().contains(&search) && !selected.contains(name)).map(|name| name.to_string()).collect()));
     ui.set_group_index(-1);
 }
 
@@ -221,11 +219,12 @@ enum Command {
     Reconnect,
     Cancel(i32),
     CloseDocument(i32),
-    CloseResult(usize, usize),
+    CloseResult(usize, usize, usize),
     Run(String, u64),
     Page(usize, usize),
     Sort(usize, usize, bool),
     Copy(usize, Option<usize>, Option<Vec<usize>>, Option<Vec<(usize, usize)>>, bool),
+    CopyCell(usize, usize, usize, usize),
     Export(usize),
     ImportSql,
     SaveSql(String, String),
@@ -802,14 +801,16 @@ impl Worker {
                     Ok(self.message("连接成功", "Connected"))
                 }
             }
-            Command::CloseResult(index, active) => {
+            Command::CloseResult(index, active, owner) => {
                 if self.sets.get(index).is_some_and(|set| !set.exported && set.count > 0) {
                     let zh = self.zh;
-                    let confirmed = tokio::task::spawn_blocking(move || rfd::MessageDialog::new()
-                        .set_title(tr(zh, "关闭结果", "Close result"))
-                        .set_description(tr(zh, "此结果尚未导出，确定关闭？", "This result has not been exported. Close it?"))
-                        .set_buttons(rfd::MessageButtons::YesNo).show()).await.map_err(|error| error.to_string())?;
-                    if confirmed != rfd::MessageDialogResult::Yes { return Ok(String::new()); }
+                    let confirmed = tokio::task::spawn_blocking(move || {
+                        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_YESNO, MB_ICONQUESTION, MB_TOPMOST, IDYES};
+                        let title: Vec<u16> = tr(zh, "关闭结果", "Close result").encode_utf16().chain(Some(0)).collect();
+                        let message: Vec<u16> = tr(zh, "此结果尚未导出，确定关闭？", "This result has not been exported. Close it?").encode_utf16().chain(Some(0)).collect();
+                        unsafe { MessageBoxW(owner as _, message.as_ptr(), title.as_ptr(), MB_YESNO | MB_ICONQUESTION | MB_TOPMOST) == IDYES }
+                    }).await.map_err(|error| error.to_string())?;
+                    if !confirmed { return Ok(String::new()); }
                 }
                 if index < self.sets.len() { self.sets.remove(index); }
                 let names = self.sets.iter().enumerate().map(|(i, set)| if set.repeats > 1 { format!("{} × {}", i + 1, set.repeats) } else { (i + 1).to_string() }).collect();
@@ -1095,6 +1096,8 @@ impl Worker {
                     ui.set_field_names(strings(field_names));
                     if action == "quick-group" {
                         ui.set_group_search("".into());
+                        ui.set_group_selected(ModelRc::default());
+                        ui.set_group_selected_index(-1);
                         filter_group(&ui);
                         ui.set_group_open(true);
                     }
@@ -1201,6 +1204,14 @@ impl Worker {
             Command::Page(index, page) => {
                 self.page(index, page)?;
                 Ok(self.message("已加载页面", "Page loaded"))
+            }
+            Command::CopyCell(index, page, row, column) => {
+                let rows = self.sets.get_mut(index).ok_or("No result set")?.page(page, false, Some(row))?;
+                let cell = rows.first().and_then(|row| row.get(column)).ok_or("No selected cell")?;
+                arboard::Clipboard::new()
+                    .and_then(|mut clipboard| clipboard.set_text(cell.as_deref().unwrap_or("NULL").to_string()))
+                    .map_err(|error| error.to_string())?;
+                Ok(self.message("已复制", "Copied"))
             }
             Command::Copy(index, page, rows, cells, headers) => {
                 let set = self.sets.get_mut(index).ok_or("No result set")?;
@@ -1582,6 +1593,14 @@ fn submit(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui = AppWindow::new()?;
+    ui.on_format_count(|count| {
+        let mut formatted = String::new();
+        for (index, digit) in count.chars().enumerate() {
+            if index > 0 && (count.len() - index) % 3 == 0 { formatted.push(','); }
+            formatted.push(digit);
+        }
+        formatted.into()
+    });
     let document_state = documents::bind(&ui);
     let (settings, error) = match config::load() {
         Ok(s) => (s, None),
@@ -1961,8 +1980,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             show_profile(&ui, Profile { port: 5432, tls: true, ..Profile::default() }, String::new());
             return;
         }
+        if matches!(action.as_str(), "add-group" | "remove-group" | "group-up" | "group-down") {
+            use slint::Model;
+            let mut selected: Vec<_> = ui.get_group_selected().iter().collect();
+            let mut index = ui.get_group_selected_index();
+            if action == "add-group" {
+                let Some(field) = ui.get_group_fields().row_data(ui.get_group_index() as usize) else { return; };
+                if selected.iter().any(|item| item.text == field.text) { return; }
+                selected.push(field);
+                index = selected.len() as i32 - 1;
+            } else {
+                if index < 0 || index as usize >= selected.len() { return; }
+                if action == "remove-group" {
+                    selected.remove(index as usize);
+                    index = index.min(selected.len() as i32 - 1);
+                } else {
+                    let next = index + if action == "group-up" { -1 } else { 1 };
+                    if next < 0 || next as usize >= selected.len() { return; }
+                    selected.swap(index as usize, next as usize);
+                    index = next;
+                }
+            }
+            ui.set_group_selected(std::rc::Rc::new(VecModel::from(selected)).into());
+            ui.set_group_selected_index(index);
+            filter_group(&ui);
+            return;
+        }
         if action == "generate-group" {
-            let field = ui.get_group_field();
+            use slint::Model;
+            let fields: Vec<_> = ui.get_group_selected().iter().map(|item| item.text.to_string()).collect();
+            if fields.is_empty() { return; }
+            let field = fields.join(", ");
             ui.set_sql(format!("SELECT {field}, COUNT(*) AS row_count\nFROM {}\nGROUP BY {field}\nORDER BY COUNT(*) DESC;", ui.get_object_name()).into());
             ui.set_group_open(false);
             return;
@@ -2184,6 +2232,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         strings(suggestions)
     });
     ui.on_insert_completion(|sql, offset, value| completion::insert(&sql, offset.max(0) as usize, &value));
+    ui.on_indent_newline(|sql, anchor, cursor| {
+        let start = anchor.min(cursor).max(0) as usize;
+        let end = anchor.max(cursor).max(0) as usize;
+        let line_start = sql[..start].rfind('\n').map_or(0, |index| index + 1);
+        let indent = &sql[line_start..start];
+        let indent = &indent[..indent.find(|c| c != ' ' && c != '\t').unwrap_or(indent.len())];
+        SqlCompletion {
+            text: format!("{}\n{indent}{}", &sql[..start], &sql[end..]).into(),
+            offset: (start + 1 + indent.len()) as i32,
+        }
+    });
     ui.on_pair_quote(|sql, anchor, cursor, quote| {
         let start = anchor.min(cursor).max(0) as usize;
         let end = anchor.max(cursor).max(0) as usize;
@@ -2202,6 +2261,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(error) => { ui.set_failed(true); ui.set_status(error.to_string().into()); }
         }
+    });
+    let weak = ui.as_weak();
+    ui.on_browser_select(move |fields, index, shift, control| {
+        let Some(ui) = weak.upgrade() else { return; };
+        let model = if fields { ui.get_fields() } else { ui.get_tables() };
+        let previous = if fields { ui.get_field_selection() } else { ui.get_object_selection() };
+        let anchor = if fields { ui.get_field_anchor() } else { ui.get_object_anchor() };
+        let count = model.row_count();
+        if index < -1 || index >= count as i32 { return; }
+        let mut selected: Vec<bool> = (0..count).map(|row| previous.row_data(row).unwrap_or(false)).collect();
+        if index == -1 {
+            selected.fill(true);
+        } else if shift && anchor >= 0 && anchor < count as i32 {
+            if !control { selected.fill(false); }
+            for row in anchor.min(index)..=anchor.max(index) { selected[row as usize] = true; }
+        } else {
+            if !control { selected.fill(false); }
+            selected[index as usize] = !selected[index as usize];
+        }
+        let selected_count = selected.iter().filter(|selected| **selected).count() as i32;
+        let selected = std::rc::Rc::new(VecModel::from(selected)).into();
+        if fields {
+            ui.set_field_selection(selected);
+            ui.set_field_selection_count(selected_count);
+            if !shift || anchor < 0 { ui.set_field_anchor(index.max(0)); }
+        } else {
+            ui.set_object_selection(selected);
+            ui.set_object_selection_count(selected_count);
+            if !shift || anchor < 0 { ui.set_object_anchor(index.max(0)); }
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_browser_copy(move |fields| {
+        let Some(ui) = weak.upgrade() else { return; };
+        let model = if fields { ui.get_fields() } else { ui.get_tables() };
+        let selection = if fields { ui.get_field_selection() } else { ui.get_object_selection() };
+        let names: Vec<_> = model.iter().enumerate().filter(|(row, _)| selection.row_data(*row).unwrap_or(false)).map(|(_, item)| item.text.to_string()).collect();
+        if !names.is_empty() { ui.invoke_copy_text(names.join("\r\n").into(), false); }
     });
     ui.on_localize_error(|error, zh| explain(zh, error.to_string()).into());
     let weak = ui.as_weak();
@@ -2350,6 +2447,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let weak = ui.as_weak();
+    let sender = tx.clone();
+    let cancel = cancelled.clone();
+    ui.on_result_cell_double_clicked(move |row, column| {
+        if let Some(ui) = weak.upgrade() {
+            if row < 0 || column < 0 || ui.get_busy() { return; }
+            submit(&ui, &sender, &cancel, Command::CopyCell(ui.get_result_index() as usize, ui.get_page() as usize, row as usize, column as usize));
+        }
+    });
+    let weak = ui.as_weak();
     ui.on_result_cell_selected(move |row, column, shift, control| {
         use slint::Model;
         if let Some(ui) = weak.upgrade() {
@@ -2394,7 +2500,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cancel = cancelled.clone();
     ui.on_close_result(move |index| {
         if let Some(ui) = weak.upgrade() {
-            submit(&ui, &sender, &cancel, Command::CloseResult(index as usize, ui.get_result_index().max(0) as usize));
+            submit(&ui, &sender, &cancel, Command::CloseResult(index as usize, ui.get_result_index().max(0) as usize, dialogs::native_window(&ui.get_window_title()) as usize));
         }
     });
     let weak = ui.as_weak();

@@ -216,6 +216,16 @@ impl ResultSet {
         String::from_utf8(data).map_err(|e| e.to_string())
     }
 
+    pub fn write_json_rows(&mut self, path: &Path) -> Result<(), String> {
+        self.finish()?;
+        self.file.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+        let mut target = tempfile::NamedTempFile::new_in(path.parent().ok_or("Invalid result path")?).map_err(|error| error.to_string())?;
+        std::io::copy(&mut self.file, &mut target).map_err(|error| error.to_string())?;
+        target.as_file().sync_all().map_err(|error| error.to_string())?;
+        target.persist(path).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub fn export(&mut self, path: &Path, cancelled: impl Fn() -> bool) -> Result<(), String> {
         self.finish()?;
         let dir = path.parent().ok_or("Invalid export path")?;

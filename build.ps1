@@ -1,4 +1,4 @@
-param([string]$LlvmBin = $env:LLVM_MINGW_BIN)
+param([string]$LlvmBin = $env:LLVM_MINGW_BIN, [switch]$CoreOnly)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 if (-not $LlvmBin -or -not (Test-Path (Join-Path $LlvmBin 'ld.lld.exe'))) {
@@ -41,8 +41,14 @@ try {
     foreach ($iconPart in $iconParts) { $iconWriter.Write([byte[]]$iconPart) }
 } finally { $iconWriter.Dispose() }
 }
-& cargo +stable-x86_64-pc-windows-gnu build --release --locked
+if ($CoreOnly) {
+    & cargo +stable-x86_64-pc-windows-gnu build --lib --release --locked
+} else {
+    & cargo +stable-x86_64-pc-windows-gnu build --release --locked
+}
 if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
+Copy-Item -LiteralPath 'target/release/myquery_core.dll' -Destination 'myquery_core.dll' -Force
+if ($CoreOnly) { return }
 $appProcesses = Get-Process -Name MyQuery,SqlDesk,sql-desk -ErrorAction SilentlyContinue
 if ($appProcesses) {
     $appProcesses | Stop-Process -Force

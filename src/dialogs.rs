@@ -3,7 +3,7 @@ use slint::{ComponentHandle, Model, VecModel};
 use std::{cell::{Cell, RefCell}, rc::Rc, time::Duration};
 use windows_sys::Win32::{Foundation::HWND, System::Threading::GetCurrentThreadId, UI::{Input::KeyboardAndMouse::EnableWindow, WindowsAndMessaging::{EnumThreadWindows, GetWindowTextLengthW, GetWindowTextW, SetWindowLongPtrW, SetForegroundWindow, GWLP_HWNDPARENT}}};
 
-fn native_window(title: &str) -> HWND {
+pub(crate) fn native_window(title: &str) -> HWND {
     struct Search { title: Vec<u16>, found: HWND }
     unsafe extern "system" fn visit(window: HWND, data: isize) -> i32 {
         let search = unsafe { &mut *(data as *mut Search) };
@@ -50,7 +50,7 @@ fn edits_to_main(dialog: &DialogWindow, ui: &AppWindow) {
     ui.set_rename_sql_text(dialog.get_rename_sql_text());
     ui.set_group_search(dialog.get_group_search());
     ui.set_group_index(dialog.get_group_index());
-    ui.set_group_field(dialog.get_group_field());
+    ui.set_group_selected_index(dialog.get_group_selected_index());
     ui.set_timeout_input(dialog.get_timeout_input());
     ui.set_scope_profile_index(dialog.get_scope_profile_index());
     ui.set_scope_database_index(dialog.get_scope_database_index());
@@ -77,7 +77,8 @@ fn refresh(ui: &AppWindow, dialog: &DialogWindow) {
     dialog.set_rename_sql_text(ui.get_rename_sql_text());
     dialog.set_group_search(ui.get_group_search());
     dialog.set_group_index(ui.get_group_index());
-    dialog.set_group_field(ui.get_group_field());
+    dialog.set_group_selected(ui.get_group_selected());
+    dialog.set_group_selected_index(ui.get_group_selected_index());
     dialog.set_timeout_input(ui.get_timeout_input());
     dialog.set_scope_profile_index(ui.get_scope_profile_index());
     dialog.set_scope_database_index(ui.get_scope_database_index());
