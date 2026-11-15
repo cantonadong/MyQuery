@@ -89,7 +89,7 @@ fn refresh(ui: &AppWindow, dialog: &DialogWindow) {
     dialog.set_rename_sql_open(ui.get_rename_sql_open());
     dialog.set_save_prompt_open(ui.get_save_prompt_open());
     dialog.set_group_open(ui.get_group_open());
-    dialog.set_busy(ui.get_busy() || (ui.get_queries_running() && (ui.get_config_open() || ui.get_scopes_open())));
+    dialog.set_busy(ui.get_busy() || ui.get_switching() || (ui.get_queries_running() && (ui.get_config_open() || ui.get_scopes_open())));
     dialog.set_document_saving(ui.get_document_saving());
     dialog.set_profiles(ui.get_profiles());
     dialog.set_browser_scopes(ui.get_browser_scopes());

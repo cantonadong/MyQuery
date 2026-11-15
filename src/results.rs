@@ -84,6 +84,10 @@ impl ResultSet {
         Ok(data.len() as u64 + 1)
     }
 
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     pub fn finish(&mut self) -> Result<(), String> {
         self.writer.flush().map_err(|e| e.to_string())
     }

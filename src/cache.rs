@@ -299,6 +299,18 @@ pub fn load_scope(profile: &Profile, schema: &str) -> Option<ScopeMetadata> {
     let scope: ScopeMetadata = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
     (scope.identity == scope_identity(profile, schema) && scope.fields.iter().all(|row| row.len() == 6) && scope.objects.iter().all(|object| object.schema_name == schema && matches!(object.kind.as_str(), "table" | "view" | "materialized_view"))).then_some(scope)
 }
+/// Every cached schema snapshot as `((redshift, host, port, user, database, schema), metadata)`.
+pub fn cached_scopes() -> Vec<((bool, String, u16, String, String, String), ScopeMetadata)> {
+    let Some(dir) = std::env::var_os("LOCALAPPDATA").map(|root| PathBuf::from(root).join("MyDataTools/metadata")) else { return Vec::new(); };
+    let Ok(entries) = fs::read_dir(dir) else { return Vec::new(); };
+    entries.flatten().filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json") && entry.metadata().is_ok_and(|meta| meta.len() <= 64 * 1024 * 1024))
+        .filter_map(|entry| {
+            let scope: ScopeMetadata = serde_json::from_slice(&fs::read(entry.path()).ok()?).ok()?;
+            let identity = serde_json::from_value(scope.identity.clone()).ok()?;
+            (scope.fields.iter().all(|row| row.len() == 6)).then_some((identity, scope))
+        })
+        .collect()
+}
 pub fn lock_scope(profile: &Profile, schema: &str) -> Result<fs::File, String> {
     let path = scope_path(profile, schema).ok_or("LOCALAPPDATA unavailable")?;
     fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;

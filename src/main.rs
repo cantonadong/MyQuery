@@ -4,6 +4,7 @@ mod cache;
 mod completion;
 mod documents;
 mod dialogs;
+mod route;
 mod syntax;
 
 use myquery_core::{config, db, results};
@@ -150,7 +151,9 @@ fn filter_objects(ui: &AppWindow) {
     for object in objects.iter() {
         let kind = object.kind as usize;
         let name = object.name.to_lowercase();
-        if kind < 3 && (name.contains(&search) || columns.iter().any(|(table, fields)| table == object.name.as_str() && fields.iter().any(|field| field.to_lowercase().contains(&search)))) && (show_hidden || name.starts_with(&prefix))
+        // In "All" views names are qualified (conn.schema.table); prefixes apply to the object name.
+        let base = name.rsplit('.').next().unwrap_or(name.as_str());
+        if kind < 3 && (name.contains(&search) || columns.iter().any(|(table, fields)| table == object.name.as_str() && fields.iter().any(|field| field.to_lowercase().contains(&search)))) && (show_hidden || base.starts_with(&prefix))
             && (show_hidden || !hidden.contains(&(object.name.clone(), object.kind))) {
             counts[kind] += 1;
             if object.kind == ui.get_object_kind() {
@@ -188,6 +191,17 @@ fn filter_group(ui: &AppWindow) {
     ui.set_group_index(-1);
 }
 
+/// Relabels the leading "All" entry of the connection, database and schema selectors.
+fn localize_all(ui: &AppWindow) {
+    let label: SharedString = tr(ui.global::<I18n>().get_zh(), "全部", "All").into();
+    for model in [ui.get_visible_profiles(), ui.get_databases(), ui.get_schemas()] {
+        if model.row_count() > 0 { model.set_row_data(0, label.clone()); }
+    }
+}
+fn with_all(zh: bool, values: Vec<String>) -> ModelRc<SharedString> {
+    strings(std::iter::once(tr(zh, "全部", "All")).chain(values).collect())
+}
+
 fn prefix_options(ui: &AppWindow) {
     use slint::Model;
     let mut options = vec![tr(ui.global::<I18n>().get_zh(), "全部", "All")];
@@ -199,6 +213,8 @@ fn prefix_options(ui: &AppWindow) {
 enum Command {
     Connect(Profile, String),
     SwitchDatabase(String),
+    /// Browse every connection (0), every database of the connection (1) or every schema (2).
+    BrowseAll(i32),
     Disconnect,
     SaveProfile(Profile, String, Option<usize>),
     DeleteProfile(usize),
@@ -252,6 +268,139 @@ struct Worker {
     current_schema: String,
     metadata_cache: cache::MetadataCache,
     query_only: bool,
+    /// Sessions opened for statements routed to other connections (`conn.table`).
+    routes: Vec<(Profile, db::Session)>,
+    browse: Browse,
+    /// "All" view entries: display name → (profile with database, schema, object).
+    all_index: std::collections::HashMap<String, (Profile, String, String)>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+struct Browse {
+    connections: bool,
+    databases: bool,
+    schemas: bool,
+}
+impl Browse {
+    fn any(self) -> bool { self.connections || self.databases || self.schemas }
+}
+
+/// Sessions a SQL tab keeps between runs.
+#[derive(Default)]
+struct TabSessions {
+    session: Option<db::Session>,
+    profile: Option<Profile>,
+    routes: Vec<(Profile, db::Session)>,
+}
+
+/// UI bookkeeping that runs after a worker command finishes.
+struct Finish {
+    selected_fields: Option<(String, String)>,
+    fields_request: bool,
+    browser_refresh: bool,
+    notify_success: bool,
+    prefetch: bool,
+    switch: bool,
+    /// A switch still holds the session, so the connection indicator must not change.
+    keep_connection: bool,
+}
+impl Finish {
+    fn new(command: &Command) -> Self {
+        Self {
+            selected_fields: match command {
+                Command::Fields(schema, table, action) if action.is_empty() => Some((schema.clone(), table.clone())),
+                _ => None,
+            },
+            fields_request: matches!(command, Command::Fields(_, _, action) if action != "completion"),
+            browser_refresh: matches!(command, Command::Refresh | Command::RefreshSchema),
+            notify_success: matches!(command, Command::Fields(_, _, action) if action == "copy-structure") || !matches!(command,
+                Command::Run(..) | Command::Page(..) | Command::Tables(..) |
+                Command::Fields(..) | Command::ScopeChoices(..) | Command::OpenScopes |
+                Command::LoadProfile(..) | Command::UseProfile(..)),
+            prefetch: matches!(command, Command::Connect(..) | Command::UseProfile(..) | Command::Reconnect),
+            switch: is_switch(command),
+            keep_connection: false,
+        }
+    }
+}
+
+fn spawn_query(
+    worker: &Worker,
+    request: Request,
+    queries: &mut tokio::task::JoinSet<(i32, Worker, Result<String, String>, Instant)>,
+    sessions: &mut std::collections::HashMap<i32, TabSessions>,
+    cancellations: &mut std::collections::HashMap<i32, Arc<AtomicBool>>,
+) {
+    if cancellations.contains_key(&request.document_id) { return; }
+    let cancelled = Arc::new(AtomicBool::new(false));
+    cancellations.insert(request.document_id, cancelled.clone());
+    let saved = sessions.remove(&request.document_id).unwrap_or_default();
+    let mut query = Worker {
+        ui: worker.ui.clone(), settings: worker.settings.clone(), session: saved.session, session_profile: saved.profile,
+        active: worker.active.clone(), sets: Vec::new(), tab_sets: std::collections::HashMap::new(),
+        result_tab: request.document_id, cancelled, zh: request.zh, settings_error: worker.settings_error.clone(),
+        current_schema: worker.current_schema.clone(), metadata_cache: cache::MetadataCache::default(), query_only: true,
+        routes: saved.routes, browse: worker.browse, all_index: std::collections::HashMap::new(),
+    };
+    queries.spawn(async move {
+        let result = query.handle(request.command).await;
+        (request.document_id, query, result, request.started)
+    });
+}
+
+fn finish_request(worker: &mut Worker, prefetches: &mut tokio::task::JoinSet<Result<(), String>>, finish: Finish, result: Result<String, String>) {
+    if finish.prefetch && result.is_ok() {
+        if let Some((profile, _)) = &worker.active {
+            let name = profile.name.clone();
+            let mut background = Worker {
+                ui: worker.ui.clone(), settings: worker.settings.clone(), session: None, session_profile: None,
+                active: None, sets: Vec::new(), tab_sets: std::collections::HashMap::new(),
+                result_tab: -1, cancelled: Arc::new(AtomicBool::new(false)), zh: worker.zh,
+                settings_error: None, current_schema: String::new(),
+                metadata_cache: cache::MetadataCache::load(), query_only: true,
+                routes: Vec::new(), browse: Browse::default(), all_index: std::collections::HashMap::new(),
+            };
+            prefetches.spawn_blocking(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| error.to_string())?;
+                runtime.block_on(background.fetch_scopes(false, Some(&name)))
+            });
+        }
+    }
+    let connected = worker.session.as_ref().is_some_and(|session| !session.client.is_closed());
+    let zh = worker.zh;
+    let Finish { selected_fields, fields_request, browser_refresh, notify_success, switch, keep_connection, .. } = finish;
+    update(&worker.ui, move |ui| {
+        if switch { ui.set_switching(false); }
+        else if selected_fields.is_none() { ui.set_busy(false); }
+        if browser_refresh { ui.set_browser_refresh(0); }
+        if fields_request && selected_fields.as_ref().is_none_or(|(schema, table)| ui.get_schema() == schema.as_str() && ui.get_fields_loading_name() == table.as_str()) { ui.set_fields_loading(false); }
+        if !keep_connection {
+            ui.set_connected(connected);
+            ui.set_reconnecting(false);
+        }
+        match result {
+            Ok(message) => {
+                ui.set_failed(false);
+                ui.set_status("".into());
+                if notify_success && !message.is_empty() { ui.invoke_notify(message.into()); }
+            }
+            Err(error) => {
+                ui.set_failed(true);
+                ui.set_status(format!("{}\n{}", tr(zh, "操作失败", "Operation failed"), explain(zh, error)).into());
+            }
+        }
+    });
+}
+
+/// Connection and browser changes run in the background so the SQL area and results stay usable.
+fn is_switch(command: &Command) -> bool {
+    matches!(command, Command::Connect(..) | Command::UseProfile(..) | Command::SwitchDatabase(..) | Command::BrowseAll(..)
+        | Command::Tables(..) | Command::Refresh | Command::RefreshSchema | Command::Reconnect)
+}
+/// Commands that only touch SQL tabs or held results; allowed while a switch is running.
+fn is_result_command(command: &Command) -> bool {
+    matches!(command, Command::Run(..) | Command::Cancel(..) | Command::Page(..) | Command::Sort(..) | Command::Copy(..)
+        | Command::CopyCell(..) | Command::Export(..) | Command::CloseResult(..) | Command::ImportSql | Command::SaveSql(..))
 }
 
 async fn guarded<T, E: From<&'static str>>(
@@ -278,12 +427,100 @@ impl Worker {
             .map(|p| p.name.clone())
             .collect();
         let visible = self.settings.visible_profiles();
-        let physical_index = self.active.as_ref().and_then(|(active, _)| visible.iter().position(|name| name == &active.name)).map_or(-1, |index| index as i32);
+        let physical_index = self.physical_index(&visible);
+        let zh = self.zh;
         update(&self.ui, move |ui| {
             ui.set_profiles(strings(profiles));
-            ui.set_visible_profiles(strings(visible));
+            ui.set_visible_profiles(with_all(zh, visible));
             ui.set_physical_index(physical_index);
         });
+    }
+    /// Selector index of the connection; 0 is "All".
+    fn physical_index(&self, visible: &[String]) -> i32 {
+        if self.browse.connections { return 0; }
+        self.active.as_ref().and_then(|(active, _)| visible.iter().position(|name| name == &active.name)).map_or(-1, |index| index as i32 + 1)
+    }
+    /// Database used for `conn.` statements and "All" views of a saved connection.
+    fn default_database(&self, profile: &Profile) -> String {
+        if let Some((active, _)) = self.active.as_ref().filter(|(active, _)| active.name == profile.name) { return active.database.clone(); }
+        let scopes: Vec<_> = self.settings.browser_scopes.iter().filter(|scope| scope.profile == profile.name).collect();
+        match scopes.first() {
+            Some(first) if !scopes.iter().any(|scope| scope.database == profile.database) => first.database.clone(),
+            _ => profile.database.clone(),
+        }
+    }
+    /// Lists cached objects for the current "All" view without opening new connections.
+    fn show_all(&mut self) -> Result<String, String> {
+        let browse = self.browse;
+        let active = self.active.as_ref().map(|(profile, _)| profile.clone());
+        let profiles: Vec<Profile> = if browse.connections {
+            self.settings.profiles.clone()
+        } else {
+            active.iter().cloned().collect()
+        };
+        let scopes = cache::cached_scopes();
+        let mut objects = Vec::new();
+        let mut columns = Vec::new();
+        self.all_index.clear();
+        for profile in &profiles {
+            let default_database = self.default_database(profile);
+            let allowed: Vec<_> = self.settings.browser_scopes.iter().filter(|scope| scope.profile == profile.name).collect();
+            for ((redshift, host, port, user, database, schema), scope) in &scopes {
+                if (*redshift, host.as_str(), *port, user.as_str()) != (profile.redshift, profile.host.as_str(), profile.port, profile.user.as_str()) { continue; }
+                if !browse.databases && *database != default_database { continue; }
+                if !allowed.is_empty() && !allowed.iter().any(|allowed| &allowed.database == database && &allowed.schema == schema) { continue; }
+                let mut fields = std::collections::HashMap::<&str, Vec<String>>::new();
+                for row in &scope.fields {
+                    if let (Some(table), Some(column)) = (row[0].as_deref(), row[1].as_deref()) { fields.entry(table).or_default().push(column.into()); }
+                }
+                for object in &scope.objects {
+                    let kind = match object.kind.as_str() { "view" => 1, "materialized_view" => 2, _ => 0 };
+                    if self.settings.hidden_objects.iter().any(|hidden| hidden.scope.profile == profile.name && &hidden.scope.database == database && &hidden.scope.schema == schema && hidden.name == object.object_name && hidden.kind == kind) { continue; }
+                    let mut segments = Vec::new();
+                    if browse.connections { segments.push(profile.name.as_str()); }
+                    if *database != default_database { segments.push(database.as_str()); }
+                    segments.extend([schema.as_str(), object.object_name.as_str()]);
+                    let display = segments.join(".");
+                    if self.all_index.contains_key(&display) { continue; }
+                    columns.push(serde_json::to_string(&(&display, fields.get(object.object_name.as_str()).cloned().unwrap_or_default())).unwrap());
+                    let mut located = profile.clone();
+                    located.database = database.clone();
+                    self.all_index.insert(display.clone(), (located, schema.clone(), object.object_name.clone()));
+                    objects.push(DbObject { name: display.into(), kind });
+                }
+            }
+        }
+        objects.sort_by(|a, b| a.name.cmp(&b.name));
+        let empty = objects.is_empty();
+        self.current_schema.clear();
+        let zh = self.zh;
+        update(&self.ui, move |ui| {
+            if browse.connections { ui.set_databases(with_all(zh, Vec::new())); }
+            if browse.databases {
+                ui.set_database_index(0);
+                ui.set_schemas(with_all(zh, Vec::new()));
+            }
+            ui.set_schema_index(0);
+            ui.set_schema("".into());
+            ui.set_hidden_objects(ModelRc::default());
+            ui.set_show_hidden(false);
+            ui.set_changed_tables(ModelRc::default());
+            ui.set_column_index(strings(columns));
+            ui.set_table_index(-1);
+            ui.set_fields(ModelRc::default());
+            ui.set_objects(std::rc::Rc::new(VecModel::from(objects)).into());
+            filter_objects(&ui);
+        });
+        self.sync_profiles();
+        Ok(if empty {
+            self.message("没有已缓存的表结构；请先逐个打开要浏览的模式，或在“浏览范围”中添加。", "No cached metadata yet; open each schema once or add it under Browsing scope.")
+        } else { String::new() })
+    }
+    /// Reloads the browser for the current selection after a reconnect or refresh.
+    async fn reload(&mut self) -> Result<(), String> {
+        if self.browse.any() { self.show_all().map(|_| ()) }
+        else if self.current_schema.is_empty() { self.refresh().await }
+        else { self.tables(&self.current_schema.clone()).await }
     }
     fn sync_hidden(&self) {
         let objects = self.settings.hidden_objects.iter().filter(|object| {
@@ -317,6 +554,8 @@ impl Worker {
         self.session_profile = None;
         self.active = None;
         self.current_schema.clear();
+        self.browse = Browse::default();
+        self.all_index.clear();
         update(&self.ui, |ui| {
             ui.set_connected(false);
             ui.set_connection_label("".into());
@@ -417,6 +656,49 @@ impl Worker {
             }
         }
     }
+    /// Prepares the selected connection's session for a run and applies the selected schema.
+    async fn prepare_session(&mut self) -> Result<Arc<tokio_postgres::Client>, String> {
+        self.ensure_session().await?;
+        let client = self.session.as_ref().ok_or_else(|| self.message("请先连接数据库", "Connect first"))?.client.clone();
+        // With "All" schemas selected, names are schema-qualified and the server default path applies.
+        let set_path = if self.current_schema.is_empty() { "RESET search_path".to_string() } else { format!("SET search_path TO {}", db::identifier(&self.current_schema)) };
+        if let Err(error) = guarded(async { client.batch_execute(&set_path).await.map_err(db::query_error) }, self.cancelled.clone(), 15).await {
+            if error.state.as_ref() != Some(&tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION) {
+                if !error.recoverable { self.invalidate().await; }
+                return Err(error.message);
+            }
+        }
+        Ok(client)
+    }
+    /// Session for statements routed to another saved connection (`conn.table`).
+    async fn route_client(&mut self, name: &str) -> Result<Arc<tokio_postgres::Client>, String> {
+        let mut profile = self.settings.profiles.iter().find(|profile| profile.name == name).cloned()
+            .ok_or_else(|| self.message("连接已被删除", "Connection was removed"))?;
+        profile.database = self.default_database(&profile);
+        self.routes.retain(|(_, session)| !session.client.is_closed());
+        if let Some((_, session)) = self.routes.iter().find(|(saved, _)| saved == &profile) {
+            return Ok(session.client.clone());
+        }
+        self.routes.retain(|(saved, _)| saved.name != profile.name);
+        let password = config::password(&profile.name)?;
+        let session = guarded(db::connect(&profile, &password), self.cancelled.clone(), 20).await
+            .map_err(|error| if error.chars().all(|c| c.is_ascii_uppercase() || c == '_') { error } else { format!("[{name}] {error}") })?;
+        let client = session.client.clone();
+        self.routes.push((profile, session));
+        Ok(client)
+    }
+    async fn drop_route(&mut self, name: &str) {
+        let Some(index) = self.routes.iter().position(|(profile, _)| profile.name == name) else { return; };
+        let (profile, session) = self.routes.remove(index);
+        let token = session.client.cancel_token();
+        if profile.tls {
+            if let Ok(tls) = db::tls_connector(&profile) {
+                let _ = tokio::time::timeout(Duration::from_secs(3), token.cancel_query(postgres_native_tls::MakeTlsConnector::new(tls))).await;
+            }
+        } else {
+            let _ = tokio::time::timeout(Duration::from_secs(3), token.cancel_query(tokio_postgres::NoTls)).await;
+        }
+    }
     async fn scope_metadata(&mut self, profile: &Profile, sql: &str) -> Result<Vec<Cells>, String> {
         if let Some(rows) = self.metadata_cache.get(profile, sql) { return Ok(rows); }
         let password = config::password(&profile.name)?;
@@ -426,10 +708,8 @@ impl Worker {
         Ok(rows)
     }
     async fn connect(&mut self, profile: Profile, password: String) -> Result<String, String> {
+        // Results already shown in SQL tabs are kept; they do not depend on the browser connection.
         self.disconnect();
-        self.sets.clear();
-        self.tab_sets.clear();
-        update(&self.ui, |ui| ui.invoke_reset_result_views());
         let scopes: Vec<_> = self.settings.browser_scopes.iter().filter(|scope| scope.profile == profile.name).collect();
         let mut profile = profile;
         if let Some(first) = scopes.first() {
@@ -441,12 +721,7 @@ impl Worker {
         self.ensure_session().await?;
         self.sync_prefixes();
         let label = format!("{} @ {} / {}", profile.user, profile.host, profile.database);
-        let physical_index = self
-            .settings
-            .visible_profiles()
-            .iter()
-            .position(|name| name == &profile.name)
-            .map_or(-1, |index| index as i32);
+        let physical_index = self.physical_index(&self.settings.visible_profiles());
         update(&self.ui, move |ui| {
             ui.set_connected(true);
             ui.set_connection_label(label.into());
@@ -499,20 +774,22 @@ impl Worker {
             .or_else(|| schemas.first())
             .cloned()
             .unwrap_or_default();
+        // Index 0 of both selectors is "All".
         let database_index = self
             .active
             .as_ref()
             .and_then(|(profile, _)| databases.iter().position(|name| name == &profile.database))
-            .map_or(-1, |index| index as i32);
+            .map_or(-1, |index| index as i32 + 1);
         let schema_index = schemas
             .iter()
             .position(|name| name == &schema)
-            .map_or(-1, |index| index as i32);
+            .map_or(-1, |index| index as i32 + 1);
         let selected_schema = schema.clone();
+        let zh = self.zh;
         update(&self.ui, move |ui| {
-            ui.set_databases(strings(databases));
+            ui.set_databases(with_all(zh, databases));
             ui.set_database_index(database_index);
-            ui.set_schemas(strings(schemas));
+            ui.set_schemas(with_all(zh, schemas));
             ui.set_schema_index(schema_index);
             ui.set_schema(schema.clone().into());
         });
@@ -522,7 +799,12 @@ impl Worker {
         if self.active.as_ref().is_some_and(|(profile, _)| self.settings.browser_scopes.iter().any(|scope| scope.profile == profile.name) && !self.settings.browser_scopes.iter().any(|scope| scope.profile == profile.name && scope.database == profile.database && scope.schema == schema)) {
             return Err(self.message("此模式不在浏览范围内", "Schema is outside the browsing scope"));
         }
-        let changed = self.current_schema != schema;
+        let changed = self.current_schema != schema || self.browse.any();
+        if self.browse.any() {
+            self.browse = Browse::default();
+            self.all_index.clear();
+            self.sync_profiles();
+        }
         self.current_schema = schema.to_owned();
         self.sync_hidden();
         if changed {
@@ -556,7 +838,9 @@ impl Worker {
             }).collect()
         }).unwrap_or_default();
         let changed = self.active.as_ref().map(|(profile, _)| self.metadata_cache.changed_tables(profile, schema, &objects)).unwrap_or_default();
+        let selected = schema.to_owned();
         update(&self.ui, move |ui| {
+            ui.set_schema(selected.into());
             ui.set_column_index(strings(columns));
             ui.set_changed_tables(strings(changed));
             ui.set_table_index(-1);
@@ -765,7 +1049,7 @@ impl Worker {
                 return Err(format!("{}\n{error}", self.message("原配置无法读取，已阻止覆盖。请修复配置文件后重启。", "Existing configuration could not be read; overwriting is blocked. Repair the file and restart.")));
             }
         }
-        if self.settings_error.is_none() {
+        if self.settings_error.is_none() && !(is_result_command(&command) && !matches!(command, Command::Run(..))) {
             let latest = config::load()?;
             let selected = match &mut command {
                 Command::LoadProfile(index) | Command::UseProfile(index) | Command::DeleteProfile(index) => Some(index),
@@ -786,11 +1070,7 @@ impl Worker {
                     self.session = None;
                     self.session_profile = None;
                     self.ensure_session().await?;
-                    if self.current_schema.is_empty() {
-                        self.refresh().await?;
-                    } else {
-                        self.tables(&self.current_schema.clone()).await?;
-                    }
+                    self.reload().await?;
                     Ok(self.message("连接成功", "Connected"))
                 } else {
                     let index = self.settings.last_selection.as_ref().and_then(|last| self.settings.profiles.iter().position(|profile| profile.name == last.profile)).ok_or_else(|| self.message("请先选择连接", "Select a connection first"))?;
@@ -861,6 +1141,7 @@ impl Worker {
                 Ok(self.message("已加载级联选项", "Cascading choices loaded"))
             }
             Command::SetObjectHidden(name, kind, hidden) => {
+                if self.browse.any() { return Err(self.message("请先选择具体的连接、库名和模式", "Select a specific connection, database and schema first")); }
                 let profile = &self.active.as_ref().ok_or_else(|| self.message("请先连接数据库", "Connect first"))?.0;
                 let object = config::HiddenObject { scope: config::BrowserSelection { profile: profile.name.clone(), database: profile.database.clone(), schema: self.current_schema.clone() }, name, kind };
                 let old = self.settings.hidden_objects.clone();
@@ -955,10 +1236,10 @@ impl Worker {
                 let label = format!("{} @ {} / {}", profile.user, profile.host, profile.database);
                 self.active = Some((profile, password));
                 self.current_schema.clear();
-                self.sets.clear();
-                self.tab_sets.clear();
+                self.browse = Browse::default();
+                self.all_index.clear();
+                self.sync_profiles();
                 update(&self.ui, move |ui| {
-                    ui.invoke_reset_result_views();
                     ui.set_database(selected.into());
                     ui.set_connection_label(label.into());
                     ui.set_schemas(ModelRc::default());
@@ -971,6 +1252,13 @@ impl Worker {
                 });
                 self.refresh().await?;
                 Ok(self.message("已切换库名", "Database selected"))
+            }
+            Command::BrowseAll(level) => {
+                if level > 0 && self.active.is_none() {
+                    return Err(self.message("请先连接数据库", "Connect first"));
+                }
+                self.browse = Browse { connections: level == 0, databases: level <= 1, schemas: true };
+                self.show_all()
             }
             Command::Disconnect => {
                 self.disconnect();
@@ -991,7 +1279,7 @@ impl Worker {
                 if !self.settings.browser_scopes.iter().any(|scope| scope.profile == profile.name && scope.database == profile.database && scope.schema == schema) && !schema.is_empty() {
                     self.load_scope(&schema, true).await?;
                 }
-                self.refresh().await?;
+                if self.browse.any() { self.show_all()?; } else { self.refresh().await?; }
                 Ok(self.message("已刷新", "Refreshed"))
             }
             Command::Tables(schema) => {
@@ -1004,8 +1292,17 @@ impl Worker {
                     .as_ref()
                     .is_some_and(|(profile, _)| profile.redshift);
                 let sql = db::columns_sql(&schema, Some(&table), redshift);
-                let cached = self.active.as_ref().and_then(|(profile, _)| self.metadata_cache.schema_columns(profile, &schema, &table));
-                let from_schema = cached.is_some();
+                // "All" entries are qualified display names resolved through the cached snapshot.
+                let located = if schema.is_empty() { self.all_index.get(&table).cloned() } else { None };
+                if schema.is_empty() && located.is_none() {
+                    return Err(self.message("未找到该对象的缓存字段，请刷新后重试", "Cached columns for this object were not found; refresh and retry"));
+                }
+                let cached = match &located {
+                    Some((profile, real_schema, real_table)) => Some(self.metadata_cache.schema_columns(profile, real_schema, real_table)
+                        .ok_or_else(|| self.message("未找到该对象的缓存字段，请刷新后重试", "Cached columns for this object were not found; refresh and retry"))?),
+                    None => self.active.as_ref().and_then(|(profile, _)| self.metadata_cache.schema_columns(profile, &schema, &table)),
+                };
+                let from_schema = cached.is_some() && located.is_none();
                 let cached = cached.or_else(|| self.active.as_ref().and_then(|(profile, _)| self.metadata_cache.get(profile, &sql)));
                 let mut rows = match cached {
                     Some(rows) => rows,
@@ -1024,9 +1321,9 @@ impl Worker {
                         self.metadata(&sql).await?
                     }
                 };
-                let added = self.active.as_ref().map(|(profile, _)| if from_schema { self.metadata_cache.changed_schema_columns(profile, &schema, &table, &rows) } else { self.metadata_cache.changed_columns(profile, &sql, &rows) }).unwrap_or_default();
+                let added = if located.is_some() { Vec::new() } else { self.active.as_ref().map(|(profile, _)| if from_schema { self.metadata_cache.changed_schema_columns(profile, &schema, &table, &rows) } else { self.metadata_cache.changed_columns(profile, &sql, &rows) }).unwrap_or_default() };
                 let objects = vec![DbObject { name: table.as_str().into(), kind: 0 }];
-                let table_changed = self.active.as_ref().is_some_and(|(profile, _)| !self.metadata_cache.changed_tables(profile, &schema, &objects).is_empty());
+                let table_changed = located.is_none() && self.active.as_ref().is_some_and(|(profile, _)| !self.metadata_cache.changed_tables(profile, &schema, &objects).is_empty());
                 for row in &mut rows {
                     let bytes = row.get(4).and_then(|value| value.as_deref()).and_then(|value| value.parse::<i32>().ok()).filter(|value| *value > 0);
                     if let Some(datatype) = &mut row[1] {
@@ -1064,7 +1361,7 @@ impl Worker {
                     .filter_map(|row| row[0].clone())
                     .collect::<Vec<_>>();
                 let fields = field_names.clone();
-                let title = format!("{schema}.{table}");
+                let title = if schema.is_empty() { table.clone() } else { format!("{schema}.{table}") };
                 update(&self.ui, move |ui| {
                     use slint::Model;
                     if ui.get_schema() != schema.as_str() { return; }
@@ -1111,80 +1408,56 @@ impl Worker {
                 if sql.len() > 2 * 1024 * 1024 {
                     return Err(self.message("SQL 超过 2 MiB 上限", "SQL exceeds 2 MiB"));
                 }
-                self.ensure_session().await?;
-                if !self.current_schema.is_empty() {
-                    let set_path = format!(
-                        "SET search_path TO {}",
-                        db::identifier(&self.current_schema)
-                    );
-                    let session = self.session.as_ref().unwrap();
-                    if let Err(error) = guarded(
-                        async {
-                            session
-                                .client
-                                .batch_execute(&set_path)
-                                .await
-                                .map_err(db::query_error)
-                        },
+                let connections: Vec<String> = self.settings.profiles.iter().map(|profile| profile.name.clone()).collect();
+                let default = self.active.as_ref().filter(|_| !self.browse.connections).map(|(profile, _)| profile.name.clone());
+                let batches = route::plan(&sql, &connections, default.as_deref()).map_err(|error| match error {
+                    route::RouteError::Missing(index, excerpt) => format!("{}\n{excerpt}", if self.browse.connections {
+                        tr(self.zh, &format!("第 {index} 条语句未指定连接。连接选择“全部”时，请用 连接.表名 指明连接。"), &format!("Statement {index} does not name a connection. With All connections selected, write connection.table."))
+                    } else { self.message("请先选择连接", "Select a connection first") }),
+                    route::RouteError::Mixed(index, names) => tr(self.zh,
+                        &format!("第 {index} 条语句引用了多个连接（{}）；一条语句只能查询一个连接。", names.join("、")),
+                        &format!("Statement {index} references several connections ({}); a statement can query only one connection.", names.join(", "))),
+                })?;
+                let deadline = Instant::now() + Duration::from_secs(timeout);
+                let several = batches.len() > 1;
+                self.sets.clear();
+                let mut sets: Vec<ResultSet> = Vec::new();
+                let mut received = 0;
+                for batch in batches {
+                    let remaining = deadline.saturating_duration_since(Instant::now()).as_secs().max(1);
+                    let primary = self.active.as_ref().is_some_and(|(profile, _)| profile.name == batch.connection);
+                    let client = if primary { self.prepare_session().await? } else { self.route_client(&batch.connection).await? };
+                    update_result(&self.ui, self.result_tab, |ui| ui.set_query_phase(1));
+                    let progress_ui = self.ui.clone();
+                    let document_id = self.result_tab;
+                    let base = received;
+                    let used: u64 = sets.iter().map(ResultSet::bytes).sum();
+                    let result = guarded(
+                        db::execute_limited(&client, &batch.sql, move |rows| {
+                            update_result(&progress_ui, document_id, move |ui| {
+                                ui.set_query_rows((base + rows).to_string().into());
+                                ui.set_query_phase(2);
+                            });
+                        }, usize::MAX, results::MAX_BYTES.saturating_sub(used)),
                         self.cancelled.clone(),
-                        15,
+                        remaining,
                     )
-                    .await
-                    {
-                        if error.state.as_ref()
-                            != Some(&tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION)
-                        {
+                    .await;
+                    match result {
+                        Ok((batch_sets, _)) => {
+                            received += batch_sets.iter().filter(|set| !set.status).map(|set| set.count).sum::<usize>();
+                            sets.extend(batch_sets);
+                            if sets.len() > 32 { return Err("LIMIT_COLUMNS".into()); }
+                        }
+                        Err(error) => {
                             if !error.recoverable {
-                                self.invalidate().await;
+                                if primary { self.invalidate().await; } else { self.drop_route(&batch.connection).await; }
                             }
-                            return Err(error.message);
+                            let code = error.message.chars().all(|c| c.is_ascii_uppercase() || c == '_');
+                            return Err(if several && !code { format!("[{}] {}", batch.connection, error.message) } else { error.message });
                         }
                     }
                 }
-                self.sets.clear();
-                let session = self
-                    .session
-                    .as_ref()
-                    .ok_or_else(|| self.message("请先连接数据库", "Connect first"))?;
-                update_result(&self.ui, self.result_tab, |ui| ui.set_query_phase(1));
-                let progress_ui = self.ui.clone();
-                let document_id = self.result_tab;
-                let result = guarded(
-                    db::execute(&session.client, &sql, move |rows| {
-                        update_result(&progress_ui, document_id, move |ui| {
-                            ui.set_query_rows(rows.to_string().into());
-                            ui.set_query_phase(2);
-                        });
-                    }),
-                    self.cancelled.clone(),
-                    timeout,
-                )
-                .await;
-                let (sets, _) = match result {
-                    Ok(value) => value,
-                    Err(error) => {
-                        if !error.recoverable {
-                            self.invalidate().await;
-                        }
-                        let message = if error.state.as_ref()
-                            == Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE)
-                        {
-                            format!(
-                                "{}\n{}: {} / {}",
-                                error.message,
-                                "Current database / schema",
-                                self.active
-                                    .as_ref()
-                                    .map(|(profile, _)| profile.database.as_str())
-                                    .unwrap_or(""),
-                                self.current_schema
-                            )
-                        } else {
-                            error.message
-                        };
-                        return Err(message);
-                    }
-                };
                 self.sets = sets;
                 let names = self.sets.iter().enumerate()
                     .map(|(i, set)| if set.repeats > 1 { format!("{} × {}", i + 1, set.repeats) } else { (i + 1).to_string() })
@@ -1378,16 +1651,7 @@ impl Worker {
                     }
                 }
                 self.sync_profiles();
-                let active_index = self
-                    .active
-                    .as_ref()
-                    .and_then(|(active, _)| {
-                        self.settings
-                            .visible_profiles()
-                            .iter()
-                            .position(|name| name == &active.name)
-                    })
-                    .map_or(-1, |i| i as i32);
+                let active_index = self.physical_index(&self.settings.visible_profiles());
                 update(&self.ui, move |ui| {
                     ui.set_profile_index(index as i32);
                     ui.set_physical_index(active_index);
@@ -1455,16 +1719,7 @@ impl Worker {
                     self.disconnect();
                 }
                 self.sync_profiles();
-                let active_index = self
-                    .active
-                    .as_ref()
-                    .and_then(|(active, _)| {
-                        self.settings
-                            .visible_profiles()
-                            .iter()
-                            .position(|name| name == &active.name)
-                    })
-                    .map_or(-1, |i| i as i32);
+                let active_index = self.physical_index(&self.settings.visible_profiles());
                 update(&self.ui, |ui| {
                     ui.set_profile_index(-1);
                     ui.set_profile_name("".into());
@@ -1509,9 +1764,6 @@ fn save_sql(path: &Path, sql: &str) -> Result<(), String> {
 }
 
 fn explain(zh: bool, error: String) -> String {
-    if let Some((message, context)) = error.rsplit_once("\nCurrent database / schema: ") {
-        return format!("{message}\n{}: {context}", tr(zh, "当前数据库 / 模式", "Current database / schema"));
-    }
     match error.as_str() {
         "PASSWORDS_BUSY" => tr(
             zh,
@@ -1567,8 +1819,10 @@ fn submit(
     let cancel_request = matches!(&command, Command::Cancel(..));
     let reconnect = matches!(&command, Command::Reconnect);
     let field_selection = matches!(&command, Command::Fields(_, _, action) if action.is_empty());
-    if (ui.get_busy() && !cancel_request) || (query && ui.get_query_running()) ||
-        (ui.get_queries_running() && matches!(&command, Command::Connect(..) | Command::UseProfile(..) | Command::SwitchDatabase(..) | Command::Disconnect | Command::Tables(..) | Command::SaveScopes(..) | Command::Refresh | Command::RefreshSchema)) {
+    let switch = is_switch(&command);
+    // Running queries own their sessions, so switching the browser connection does not affect them.
+    if (ui.get_busy() && !cancel_request) || (query && ui.get_query_running())
+        || (ui.get_switching() && !is_result_command(&command)) {
         return;
     }
     let zh = ui.global::<I18n>().get_zh();
@@ -1578,7 +1832,8 @@ fn submit(
         Ok(()) => {
             if reconnect { ui.set_reconnecting(true); }
             if query { clear_results(ui); ui.invoke_query_started(); ui.invoke_query_state_changed(ui.get_active_document(), true); }
-            if !query && !cancel_request && !field_selection { ui.set_busy(true); }
+            if switch { ui.set_switching(true); }
+            else if !query && !cancel_request && !field_selection { ui.set_busy(true); }
             if browser_refresh != 0 { ui.set_browser_refresh(browser_refresh); }
             ui.set_failed(false);
             ui.set_status("".into());
@@ -1624,7 +1879,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_profiles(strings(
         settings.profiles.iter().map(|p| p.name.clone()).collect(),
     ));
-    ui.set_visible_profiles(strings(settings.visible_profiles()));
+    ui.set_visible_profiles(with_all(zh, settings.visible_profiles()));
     prefix_options(&ui);
     let restore_index = settings.last_selection.as_ref().and_then(|last| {
         settings
@@ -1657,7 +1912,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui.set_status(tr(ui.global::<I18n>().get_zh(), "请先完成或取消保存", "Finish or cancel the save first").into());
                 return slint::CloseRequestResponse::KeepWindowShown;
             }
-            if ui.get_busy() || ui.get_sql_tabs().iter().any(|tab| tab.running) {
+            if ui.get_busy() || ui.get_switching() || ui.get_sql_tabs().iter().any(|tab| tab.running) {
                 close_pending.store(true, Ordering::Relaxed);
                 close_cancel.store(true, Ordering::Relaxed);
                 ui.set_status(
@@ -1713,9 +1968,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     current_schema: String::new(),
                     metadata_cache: cache::MetadataCache::load(),
                     query_only: false,
+                    routes: Vec::new(),
+                    browse: Browse::default(),
+                    all_index: std::collections::HashMap::new(),
                 };
                 let mut queries = tokio::task::JoinSet::<(i32, Worker, Result<String, String>, Instant)>::new();
-                let mut sessions = std::collections::HashMap::new();
+                let mut sessions = std::collections::HashMap::<i32, TabSessions>::new();
+                // Connection/browser changes run here; runs submitted meanwhile wait in `pending`.
+                let mut switches = tokio::task::JoinSet::<(Worker, Result<String, String>, Finish)>::new();
+                let mut pending: Vec<Request> = Vec::new();
                 let mut cancellations = std::collections::HashMap::<i32, Arc<AtomicBool>>::new();
                 let mut open_documents = std::collections::HashSet::new();
                 let mut heartbeat = tokio::time::interval(Duration::from_millis(250));
@@ -1729,7 +1990,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(Ok((id, mut query, result, started))) = completed {
                                 cancellations.remove(&id);
                                 if !open_documents.contains(&id) { continue; }
-                                sessions.insert(id, (query.session.take(), query.session_profile.take()));
+                                sessions.insert(id, TabSessions { session: query.session.take(), profile: query.session_profile.take(), routes: std::mem::take(&mut query.routes) });
                                 if worker.result_tab == id { worker.sets = std::mem::take(&mut query.sets); }
                                 else { worker.tab_sets.insert(id, std::mem::take(&mut query.sets)); }
                                 let elapsed = started.elapsed().as_secs_f32();
@@ -1743,6 +2004,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             continue;
                         },
+                        switched = switches.join_next(), if !switches.is_empty() => {
+                            match switched {
+                                Some(Ok((mut browser, result, finish))) => {
+                                    worker.session = browser.session.take();
+                                    worker.session_profile = browser.session_profile.take();
+                                    worker.active = browser.active.take();
+                                    worker.current_schema = std::mem::take(&mut browser.current_schema);
+                                    worker.metadata_cache = std::mem::take(&mut browser.metadata_cache);
+                                    worker.settings = std::mem::take(&mut browser.settings);
+                                    worker.browse = browser.browse;
+                                    worker.all_index = std::mem::take(&mut browser.all_index);
+                                    finish_request(&mut worker, &mut prefetches, finish, result);
+                                }
+                                _ => update(&worker.ui, |ui| { ui.set_switching(false); ui.set_browser_refresh(0); }),
+                            }
+                            for request in std::mem::take(&mut pending) {
+                                if open_documents.contains(&request.document_id) {
+                                    spawn_query(&worker, request, &mut queries, &mut sessions, &mut cancellations);
+                                }
+                            }
+                            continue;
+                        },
                         prefetched = prefetches.join_next(), if !prefetches.is_empty() => {
                             if let Some(Ok(Err(error))) = prefetched {
                                 let zh = worker.zh;
@@ -1752,7 +2035,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                         reconnected = reconnects.join_next(), if !reconnects.is_empty() => {
                             if let Some(Ok((profile, Ok(session)))) = reconnected {
-                                if worker.active.as_ref().is_some_and(|(active, _)| active == &profile)
+                                if switches.is_empty() && worker.active.as_ref().is_some_and(|(active, _)| active == &profile)
                                     && worker.session.as_ref().is_none_or(|session| session.client.is_closed()) {
                                     worker.session = Some(session);
                                     worker.session_profile = Some(profile);
@@ -1761,11 +2044,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         ui.set_reconnecting(false);
                                         ui.set_busy(true);
                                     });
-                                    let result = if worker.current_schema.is_empty() {
-                                        worker.refresh().await
-                                    } else {
-                                        worker.tables(&worker.current_schema.clone()).await
-                                    };
+                                    let result = worker.reload().await;
                                     let connected = worker.session.as_ref().is_some_and(|session| !session.client.is_closed());
                                     let zh = worker.zh;
                                     update(&worker.ui, move |ui| {
@@ -1784,11 +2063,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         _ = heartbeat.tick() => {
                             if closing.load(Ordering::Relaxed) {
                                 for cancel in cancellations.values() { cancel.store(true, Ordering::Relaxed); }
-                                if queries.is_empty() {
+                                pending.clear();
+                                if queries.is_empty() && switches.is_empty() {
                                     closing.store(false, Ordering::Relaxed);
                                     update(&worker.ui, |ui| ui.invoke_close_documents());
                                 }
                             }
+                            // The session is on loan to the running switch.
+                            if !switches.is_empty() { continue; }
                             let connected = worker.session.as_ref().is_some_and(|session| !session.client.is_closed());
                             if !connected && !closing.load(Ordering::Relaxed) && reconnects.is_empty() && last_reconnect.elapsed() >= Duration::from_secs(5) {
                                 if let Some((profile, password)) = worker.active.clone() {
@@ -1812,30 +2094,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         worker.tab_sets.remove(id);
                         if worker.result_tab == *id { worker.sets.clear(); }
                         if let Some(cancel) = cancellations.get(id) { cancel.store(true, Ordering::Relaxed); }
+                        pending.retain(|queued| queued.document_id != *id);
                         continue;
                     }
                     if let Command::Cancel(id) = &request.command {
                         if let Some(cancel) = cancellations.get(id) { cancel.store(true, Ordering::Relaxed); }
+                        if let Some(index) = pending.iter().position(|queued| queued.document_id == *id) {
+                            let queued = pending.remove(index);
+                            let (id, elapsed) = (*id, queued.started.elapsed().as_secs_f32());
+                            update_result(&worker.ui, id, move |ui| {
+                                ui.set_query_running(false);
+                                ui.set_query_elapsed(elapsed);
+                                ui.set_query_phase(4);
+                                ui.set_query_error("CANCELLED".into());
+                                ui.invoke_query_state_changed(id, false);
+                            });
+                        }
                         continue;
                     }
                     sessions.retain(|id, _| request.open_documents.contains(id));
                     for (id, cancel) in &cancellations {
                         if !request.open_documents.contains(id) { cancel.store(true, Ordering::Relaxed); }
                     }
+                    pending.retain(|queued| request.open_documents.contains(&queued.document_id));
                     if matches!(&request.command, Command::Run(..)) {
-                        if cancellations.contains_key(&request.document_id) { continue; }
-                        let cancelled = Arc::new(AtomicBool::new(false));
-                        cancellations.insert(request.document_id, cancelled.clone());
-                        let (session, session_profile) = sessions.remove(&request.document_id).unwrap_or((None, None));
-                        let mut query = Worker {
-                            ui: worker.ui.clone(), settings: worker.settings.clone(), session, session_profile,
-                            active: worker.active.clone(), sets: Vec::new(), tab_sets: std::collections::HashMap::new(),
-                            result_tab: request.document_id, cancelled, zh: request.zh, settings_error: worker.settings_error.clone(),
-                            current_schema: worker.current_schema.clone(), metadata_cache: cache::MetadataCache::default(), query_only: true,
+                        // A run submitted while the connection is switching uses the new selection.
+                        if !switches.is_empty() {
+                            if !pending.iter().any(|queued| queued.document_id == request.document_id) { pending.push(request); }
+                        } else {
+                            spawn_query(&worker, request, &mut queries, &mut sessions, &mut cancellations);
+                        }
+                        continue;
+                    }
+                    if is_switch(&request.command) {
+                        if !switches.is_empty() { continue; }
+                        worker.zh = request.zh;
+                        let finish = Finish::new(&request.command);
+                        let mut browser = Worker {
+                            ui: worker.ui.clone(), settings: worker.settings.clone(), session: worker.session.take(),
+                            session_profile: worker.session_profile.take(), active: worker.active.clone(), sets: Vec::new(),
+                            tab_sets: std::collections::HashMap::new(), result_tab: worker.result_tab, cancelled: worker.cancelled.clone(),
+                            zh: worker.zh, settings_error: worker.settings_error.clone(), current_schema: worker.current_schema.clone(),
+                            metadata_cache: std::mem::take(&mut worker.metadata_cache), query_only: false, routes: Vec::new(),
+                            browse: worker.browse, all_index: std::mem::take(&mut worker.all_index),
                         };
-                        queries.spawn(async move {
-                            let result = query.handle(request.command).await;
-                            (request.document_id, query, result, request.started)
+                        let command = request.command;
+                        switches.spawn(async move {
+                            let result = browser.handle(command).await;
+                            (browser, result, finish)
                         });
                         continue;
                     }
@@ -1846,63 +2152,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     worker.tab_sets.retain(|id, _| request.open_documents.contains(id));
                     worker.zh = request.zh;
-                    let selected_fields = match &request.command {
-                        Command::Fields(schema, table, action) if action.is_empty() => {
-                            Some((schema.clone(), table.clone()))
-                        }
-                        _ => None,
-                    };
-                    let fields_request = matches!(&request.command, Command::Fields(_, _, action) if action != "completion");
-                    let browser_refresh = matches!(&request.command, Command::Refresh | Command::RefreshSchema);
-                    let notify_success = matches!(&request.command, Command::Fields(_, _, action) if action == "copy-structure") || !matches!(&request.command,
-                        Command::Run(..) | Command::Page(..) | Command::Tables(..) |
-                        Command::Fields(..) | Command::ScopeChoices(..) | Command::OpenScopes |
-                        Command::LoadProfile(..) | Command::UseProfile(..));
-                    let prefetch = matches!(&request.command, Command::Connect(..) | Command::UseProfile(..) | Command::Reconnect);
+                    let finish = Finish::new(&request.command);
                     let result = worker.handle(request.command).await;
-                    if prefetch && result.is_ok() {
-                        if let Some((profile, _)) = &worker.active {
-                            let name = profile.name.clone();
-                            let mut background = Worker {
-                                ui: worker.ui.clone(), settings: worker.settings.clone(), session: None, session_profile: None,
-                                active: None, sets: Vec::new(), tab_sets: std::collections::HashMap::new(),
-                                result_tab: -1, cancelled: Arc::new(AtomicBool::new(false)), zh: worker.zh,
-                                settings_error: None, current_schema: String::new(),
-                                metadata_cache: cache::MetadataCache::load(), query_only: true,
-                            };
-                            prefetches.spawn_blocking(move || {
-                                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| error.to_string())?;
-                                runtime.block_on(background.fetch_scopes(false, Some(&name)))
-                            });
-                        }
-                    }
-                    let connected = worker.session.as_ref().is_some_and(|session| !session.client.is_closed());
-                    let zh = worker.zh;
-                    update(&worker.ui, move |ui| {
-                        if selected_fields.is_none() { ui.set_busy(false); }
-                        if browser_refresh { ui.set_browser_refresh(0); }
-                        if fields_request && selected_fields.as_ref().is_none_or(|(schema, table)| ui.get_schema() == schema.as_str() && ui.get_fields_loading_name() == table.as_str()) { ui.set_fields_loading(false); }
-                        ui.set_connected(connected);
-                        ui.set_reconnecting(false);
-                        match result {
-                            Ok(message) => {
-                                ui.set_failed(false);
-                                ui.set_status("".into());
-                                if notify_success && !message.is_empty() { ui.invoke_notify(message.into()); }
-                            }
-                            Err(error) => {
-                                ui.set_failed(true);
-                                ui.set_status(
-                                    format!(
-                                        "{}\n{}",
-                                        tr(zh, "操作失败", "Operation failed"),
-                                        explain(zh, error)
-                                    )
-                                    .into(),
-                                );
-                            }
-                        }
-                    });
+                    // During a switch the session is on loan; keep the connection indicator as it is.
+                    let finish = Finish { keep_connection: !switches.is_empty(), ..finish };
+                    finish_request(&mut worker, &mut prefetches, finish, result);
                 }
             });
         })?;
@@ -2204,6 +2458,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.on_physical_selected(move |index| {
         use slint::Model;
         if let Some(ui) = weak.upgrade() {
+            if index == 0 {
+                submit(&ui, &sender, &cancel, Command::BrowseAll(0));
+                return;
+            }
             if let Some(name) = ui.get_visible_profiles().row_data(index as usize) {
                 if let Some(index) = ui.get_profiles().iter().position(|profile| profile == name) {
                     submit(&ui, &sender, &cancel, Command::UseProfile(index));
@@ -2225,8 +2483,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let index: Vec<(String, Vec<String>)> = ui.get_column_index().iter().filter_map(|entry| serde_json::from_str(entry.as_str()).ok()).collect();
         let tables: Vec<_> = ui.get_tables().iter().map(|object| (object.text.to_string(), index.iter().find(|(name, _)| name == object.text.as_str()).map(|(_, columns)| columns.clone()).unwrap_or_default())).collect();
         let mut missing = None;
-        let suggestions = completion::suggest(&sql, offset.max(0) as usize, &tables, &ui.get_schema(), &mut missing);
-        if let Some(table) = missing.filter(|_| !ui.get_busy() && ui.get_connected()) {
+        let connection = (ui.get_physical_index() > 0).then(|| ui.get_visible_profiles().row_data(ui.get_physical_index() as usize)).flatten();
+        let suggestions = completion::suggest(&sql, offset.max(0) as usize, &tables, &ui.get_schema(), connection.as_deref(), &mut missing);
+        if let Some(table) = missing.filter(|_| !ui.get_busy() && !ui.get_switching() && ui.get_connected()) {
             submit(&ui, &completion_sender, &completion_cancel, Command::Fields(ui.get_schema().to_string(), table, "completion".into()));
         }
         strings(suggestions)
@@ -2339,22 +2598,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let sender = tx.clone();
     let cancel = cancelled.clone();
-    ui.on_database_selected(move |name| {
+    ui.on_database_selected(move |index, name| {
         if let Some(ui) = weak.upgrade() {
-            submit(
-                &ui,
-                &sender,
-                &cancel,
-                Command::SwitchDatabase(name.to_string()),
-            );
+            let command = if index == 0 { Command::BrowseAll(1) } else { Command::SwitchDatabase(name.to_string()) };
+            submit(&ui, &sender, &cancel, command);
         }
     });
     let weak = ui.as_weak();
     let sender = tx.clone();
     let cancel = cancelled.clone();
-    ui.on_schema_selected(move |name| {
+    ui.on_schema_selected(move |index, name| {
         if let Some(ui) = weak.upgrade() {
-            submit(&ui, &sender, &cancel, Command::Tables(name.to_string()));
+            let command = if index == 0 { Command::BrowseAll(2) } else { Command::Tables(name.to_string()) };
+            submit(&ui, &sender, &cancel, command);
         }
     });
     let weak = ui.as_weak();
@@ -2547,6 +2803,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ui) = weak.upgrade() {
             localize_result(&ui);
             prefix_options(&ui);
+            localize_all(&ui);
             submit(
                 &ui,
                 &sender,

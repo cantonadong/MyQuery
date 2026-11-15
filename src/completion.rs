@@ -22,7 +22,31 @@ fn name(value: &str) -> String {
     else { crate::db::identifier(value) }
 }
 
-pub fn suggest(sql: &str, offset: usize, tables: &[(String, Vec<String>)], schema: &str, missing: &mut Option<String>) -> Vec<String> {
+fn unquote(value: &str) -> String { value.trim_matches('"').replace("\"\"", "\"") }
+fn same(a: &str, b: &str) -> bool { a.to_lowercase() == b.to_lowercase() }
+
+/// Whether a typed reference such as `orders`, `conn.orders` or `conn.public.orders` names the
+/// browser entry `name` (whose segments may include connection, database and schema).
+fn names_table(name: &str, chain: &[String], exact: bool) -> bool {
+    let segments: Vec<&str> = name.split('.').collect();
+    if exact { return segments.len() == chain.len() && segments.iter().zip(chain).all(|(a, b)| same(a, b)); }
+    let Some((last, qualifiers)) = chain.split_last() else { return false; };
+    if !segments.last().is_some_and(|segment| same(segment, last)) { return false; }
+    let mut rest = segments[..segments.len() - 1].iter();
+    qualifiers.iter().all(|qualifier| rest.any(|segment| same(segment, qualifier)))
+}
+
+fn resolve<'a>(chain: &[String], tables: &'a [(String, Vec<String>)], connection: Option<&str>) -> Option<&'a (String, Vec<String>)> {
+    let stripped = chain.first().filter(|first| connection.is_some_and(|connection| same(first, connection))).map(|_| &chain[1..]);
+    tables.iter().find(|(name, _)| names_table(name, chain, true))
+        .or_else(|| tables.iter().find(|(name, _)| names_table(name, chain, false)))
+        .or_else(|| stripped.and_then(|chain| tables.iter().find(|(name, _)| names_table(name, chain, false))))
+        .or_else(|| chain.last().and_then(|last| tables.iter().find(|(name, _)| name.rsplit('.').next().is_some_and(|segment| same(segment, last)))))
+}
+
+/// `connection` is the selected connection (None when all connections are browsed); a leading
+/// `connection.` prefix on its own tables is accepted and stripped.
+pub fn suggest(sql: &str, offset: usize, tables: &[(String, Vec<String>)], schema: &str, connection: Option<&str>, missing: &mut Option<String>) -> Vec<String> {
     let offset = offset.min(sql.len());
     if !sql.is_char_boundary(offset) || sql.len() > 64 * 1024 { return Vec::new(); }
     let ranges = syntax::tokens(sql);
@@ -57,12 +81,17 @@ pub fn suggest(sql: &str, offset: usize, tables: &[(String, Vec<String>)], schem
     let right = tokens.iter().position(|(text, begin, _)| text == ";" && *begin >= offset).unwrap_or(tokens.len());
     let tokens = &tokens[left..right];
     let fragment_start = start(sql, offset);
-    let prefix = sql[fragment_start..offset].trim_matches('"').replace("\"\"", "\"").to_lowercase();
-    let qualifier = tokens.iter().position(|(text, _, end)| text == "." && *end == fragment_start)
-        .and_then(|index| index.checked_sub(1)).map(|index| tokens[index].0.trim_matches('"').replace("\"\"", "\""));
-    if prefix.is_empty() && qualifier.is_none() { return Vec::new(); }
+    let prefix = unquote(&sql[fragment_start..offset]).to_lowercase();
+    let mut qualifier: Vec<String> = Vec::new();
+    let mut boundary = fragment_start;
+    while let Some(index) = tokens.iter().position(|(text, _, end)| text == "." && *end == boundary) {
+        let Some(previous) = index.checked_sub(1).filter(|previous| tokens[*previous].0.starts_with('"') || tokens[*previous].0.chars().next().is_some_and(word)) else { break; };
+        qualifier.insert(0, unquote(&tokens[previous].0));
+        boundary = tokens[previous].1;
+    }
+    if prefix.is_empty() && qualifier.is_empty() { return Vec::new(); }
     // shortcut: resolve physical tables in this statement; add scoped parsing for CTE output inference.
-    let mut references = Vec::new();
+    let mut references: Vec<(Vec<String>, String)> = Vec::new();
     let mut in_from = false;
     let mut index = 0;
     while index < tokens.len() {
@@ -72,42 +101,65 @@ pub fn suggest(sql: &str, offset: usize, tables: &[(String, Vec<String>)], schem
             in_from = true;
             index += 1;
             if index >= tokens.len() || tokens[index].0 == "(" { continue; }
-            let mut table = tokens[index].0.trim_matches('"').replace("\"\"", "\"");
-            if index + 2 < tokens.len() && tokens[index + 1].0 == "." {
+            let mut chain = vec![unquote(&tokens[index].0)];
+            while index + 2 < tokens.len() && tokens[index + 1].0 == "." {
                 index += 2;
-                table = tokens[index].0.trim_matches('"').replace("\"\"", "\"");
+                chain.push(unquote(&tokens[index].0));
             }
-            let mut alias = table.clone();
+            let mut alias = chain.last().cloned().unwrap_or_default();
             let mut next = index + 1;
             if next < tokens.len() && tokens[next].0.eq_ignore_ascii_case("as") { next += 1; }
             if let Some((candidate, _, _)) = tokens.get(next) {
                 if (candidate.starts_with('"') || candidate.chars().next().is_some_and(word)) && !keyword(candidate) {
-                    alias = candidate.trim_matches('"').replace("\"\"", "\"");
+                    alias = unquote(candidate);
                 }
             }
-            references.push((table, alias));
+            references.push((chain, alias));
         }
         index += 1;
     }
-    let only_table = if let Some(qualifier) = &qualifier {
-        references.iter().find(|(table, alias)| alias.eq_ignore_ascii_case(qualifier) || table.eq_ignore_ascii_case(qualifier)).map(|(table, _)| table)
-    } else if references.len() == 1 { Some(&references[0].0) } else { None };
-    let mut choices = Vec::new();
-    let table_context = tokens.iter().rev().find(|(_, _, end)| *end <= fragment_start).is_some_and(|(text, _, _)| matches!(text.to_ascii_lowercase().as_str(), "from" | "join" | "update" | "into"));
-    if let Some(table) = only_table.filter(|_| !table_context) {
-        if let Some((name, columns)) = tables.iter().find(|(candidate, _)| candidate.eq_ignore_ascii_case(table)) {
-            if columns.is_empty() { *missing = Some(name.clone()); }
-            choices.extend(columns.iter().cloned());
+    let only_table = if qualifier.is_empty() {
+        (references.len() == 1).then(|| references[0].0.clone())
+    } else {
+        references.iter().find(|(_, alias)| qualifier.len() == 1 && same(alias, &qualifier[0])).map(|(chain, _)| chain.clone())
+            .or_else(|| references.iter().find(|(chain, _)| chain.len() >= qualifier.len() && chain[chain.len() - qualifier.len()..].iter().zip(&qualifier).all(|(a, b)| same(a, b))).map(|(chain, _)| chain.clone()))
+            .or_else(|| (qualifier.len() >= 2).then(|| qualifier.clone()).filter(|chain| resolve(chain, tables, connection).is_some()))
+    };
+    let mut columns = Vec::new();
+    let mut objects = Vec::new();
+    let table_context = tokens.iter().rev().find(|(_, _, end)| *end <= boundary).is_some_and(|(text, _, _)| matches!(text.to_ascii_lowercase().as_str(), "from" | "join" | "update" | "into"));
+    if let Some(chain) = only_table.as_ref().filter(|_| !table_context) {
+        if let Some((name, fields)) = resolve(chain, tables, connection) {
+            if fields.is_empty() { *missing = Some(name.clone()); }
+            columns.extend(fields.iter().cloned());
         }
     }
-    if (table_context || only_table.is_none()) && qualifier.as_ref().is_none_or(|qualifier| qualifier.eq_ignore_ascii_case(schema)) {
-        choices.extend(tables.iter().map(|(table, _)| table.clone()));
+    if table_context || only_table.is_none() {
+        // `conn.` / `schema.` / `conn.schema.` select the browser entries under that qualifier.
+        let mut variants = vec![qualifier.as_slice()];
+        if qualifier.first().is_some_and(|first| connection.is_some_and(|connection| same(first, connection))) { variants.push(&qualifier[1..]); }
+        for variant in variants.clone() {
+            if variant.first().is_some_and(|first| same(first, schema)) { variants.push(&variant[1..]); }
+        }
+        for (table, _) in tables {
+            let segments: Vec<&str> = table.split('.').collect();
+            if let Some(variant) = variants.iter().find(|variant| segments.len() > variant.len() && segments.iter().zip(variant.iter()).all(|(a, b)| same(a, b))) {
+                objects.push(segments[variant.len()..].join("."));
+            }
+        }
     }
-    choices.retain(|value| value.to_lowercase().starts_with(&prefix) && value.to_lowercase() != prefix);
+    columns.retain(|value| value.to_lowercase().starts_with(&prefix) && value.to_lowercase() != prefix);
+    objects.retain(|value| {
+        let value = value.to_lowercase();
+        value != prefix && (value.starts_with(&prefix) || value.rsplit('.').next().is_some_and(|last| last.starts_with(&prefix)))
+    });
+    let mut choices: Vec<String> = columns.iter().map(|value| name(value))
+        .chain(objects.iter().map(|value| value.split('.').map(name).collect::<Vec<_>>().join(".")))
+        .collect();
     choices.sort();
     choices.dedup();
     choices.truncate(50);
-    choices.iter().map(|value| name(value)).collect()
+    choices
 }
 
 #[cfg(test)]
@@ -119,9 +171,19 @@ mod tests {
         let tables = vec![("orders".into(), vec!["order_id".into()]), ("people".into(), vec!["person_id".into()])];
         let mut missing = None;
         for (sql, offset) in [("SELECT o. FROM orders AS o JOIN people AS p ON o.order_id = p.person_id", 9), ("SELECT ord FROM orders", 10)] {
-            assert_eq!(suggest(sql, offset, &tables, "public", &mut missing), vec!["order_id"]);
+            assert_eq!(suggest(sql, offset, &tables, "public", Some("prod"), &mut missing), vec!["order_id"]);
         }
-        assert!(suggest("SELECT p. FROM people p", 9, &tables[..1], "public", &mut missing).is_empty());
+        assert!(suggest("SELECT p. FROM people p", 9, &tables[..1], "public", Some("prod"), &mut missing).is_empty());
         assert_eq!(insert("SELECT ord_id FROM orders", 10, "order_id").text.as_str(), "SELECT order_id FROM orders");
+    }
+
+    #[test]
+    fn completion_understands_connection_prefixes() {
+        let all = vec![("prod.public.orders".into(), vec!["order_id".into()]), ("dw.sales.facts".into(), vec!["fact_id".into()])];
+        let mut missing = None;
+        assert_eq!(suggest("SELECT * FROM prod.", 19, &all, "", None, &mut missing), vec!["public.orders"]);
+        assert_eq!(suggest("SELECT prod.orders. FROM prod.orders", 19, &all, "", None, &mut missing), vec!["order_id"]);
+        let selected = vec![("orders".into(), vec!["order_id".into()])];
+        assert_eq!(suggest("SELECT * FROM prod.ord", 22, &selected, "public", Some("prod"), &mut missing), vec!["orders"]);
     }
 }
