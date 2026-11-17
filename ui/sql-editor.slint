@@ -57,9 +57,15 @@ export component SqlEditor inherits Rectangle {
         root.found = root.find(root.needle, root.found.start, backward);
         if root.found.start >= 0 { input.set-selection-offsets(root.found.start, root.found.end); }
     }
-    function refresh-find() {
+    function refresh-find(select-match: bool) {
         root.found = { start: -1, end: -1, count: 0, ordinal: 0 };
-        if root.find-open { root.find-next(false); }
+        if root.find-open {
+            if select-match { root.find-next(false); }
+            else {
+                let found = root.find(root.needle, -1, false);
+                root.found = { start: -1, end: -1, count: found.count, ordinal: 0 };
+            }
+        }
     }
     function close-find() { root.find-open = false; input.focus(); }
     private property <bool> colored: root.text == root.highlighted-source && root.lines.length > 0 && input.preedit-text == "";
@@ -70,7 +76,7 @@ export component SqlEditor inherits Rectangle {
     border-color: input.has-focus ? Theme.focus : Theme.border;
     border-radius: Theme.control-radius;
     forward-focus: input;
-    changed text => { root.refresh-find(); root.highlight(root.text); metric.set-selection-offsets(3, 3); }
+    changed text => { root.refresh-find(false); root.highlight(root.text); metric.set-selection-offsets(3, 3); }
     init => { root.highlight(root.text); metric.set-selection-offsets(3, 3); }
     metric := TextInput {
         visible: false; text: "Mg\nMg"; single-line: false; wrap: no-wrap; font-family: "Consolas"; font-size: 13px;
@@ -89,10 +95,11 @@ export component SqlEditor inherits Rectangle {
             content-width: max(self.visible-width, input.preferred-width + 4px);
             content-height: max(self.visible-height, input.preferred-height);
             for line[index] in root.lines: Rectangle {
-                visible: root.colored;
                 x: 0px; y: index * root.line-height;
                 width: scroll.content-width; height: root.line-height;
                 clip: true;
+                if root.colored && index * root.line-height + scroll.content-y >= -root.line-height && index * root.line-height + scroll.content-y <= scroll.visible-height: Rectangle {
+                width: parent.width; height: parent.height;
                 for run in line: TextInput {
                     width: parent.width; height: parent.height;
                     text: run.source; color: transparent;
@@ -108,6 +115,7 @@ export component SqlEditor inherits Rectangle {
                     changed start => { self.set-selection-offsets(self.start, self.end); }
                     changed end => { self.set-selection-offsets(self.start, self.end); }
                 }
+                }
             }
             input := TextInput {
                 x: 0px; y: 0px;
@@ -121,7 +129,7 @@ export component SqlEditor inherits Rectangle {
                 selection-background-color: root.find-open && root.found.start >= 0 ? Theme.search-match : Theme.editor-selection;
                 selection-foreground-color: root.find-open && root.found.start >= 0 ? Theme.search-match-text : Theme.text;
                 page-height: scroll.visible-height;
-                edited => { root.highlight(root.text); root.completion-pending = true; }
+                edited => { input.focus(); root.highlight(root.text); root.completion-pending = true; }
                 key-pressed(event) => {
                     if !root.read-only && !event.modifiers.control && !event.modifiers.alt && (event.text == "'" || event.text == "\"") {
                         let edit = root.pair-quote(root.text, input.anchor-position-byte-offset, input.cursor-position-byte-offset, event.text);
@@ -184,8 +192,9 @@ export component SqlEditor inherits Rectangle {
         search-input := LineEdit {
             height: 32px;
             text <=> root.needle;
+            changed has-focus => { if self.has-focus { self.select-all(); } }
             placeholder-text: root.zh ? "查找 SQL" : "Find in SQL";
-            edited => { root.refresh-find(); }
+            edited => { root.refresh-find(true); }
             accepted => { root.find-next(false); }
             key-pressed(event) => {
                 if event.text == Key.Escape { root.close-find(); return accept; }
@@ -196,7 +205,23 @@ export component SqlEditor inherits Rectangle {
         Text { text: root.found.ordinal + " / " + root.found.count; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
         Rectangle { width: 24px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "↑"; label: root.zh ? "上一处" : "Previous match"; enabled: root.found.count > 0; clicked => { root.find-next(true); } } }
         Rectangle { width: 24px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "↓"; label: root.zh ? "下一处" : "Next match"; enabled: root.found.count > 0; clicked => { root.find-next(false); } } }
-        Rectangle { width: 24px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "×"; label: root.zh ? "关闭查找" : "Close find"; clicked => { root.close-find(); } } }
+        Rectangle { width: 24px; height: 32px; horizontal-stretch: 0;
+            Rectangle {
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                width: Theme.inline-button-size; height: Theme.inline-button-size;
+                border-width: 1px; border-radius: Theme.control-radius;
+                border-color: close-touch.has-hover ? Theme.destructive : close-focus.has-focus ? Theme.focus : transparent;
+                background: close-touch.has-hover ? Theme.destructive : transparent;
+                Image { x: (parent.width - 12px) / 2; y: (parent.height - 12px) / 2; width: 12px; height: 12px; source: @image-url("icons/close.svg"); image-fit: contain; colorize: close-touch.has-hover ? white : Theme.dark ? Theme.heading : transparent; }
+                accessible-role: button; accessible-label: root.zh ? "关闭查找" : "Close find";
+                accessible-action-default => { root.close-find(); }
+                close-focus := FocusScope {
+                    width: 100%; height: 100%; focus-on-click: false;
+                    key-pressed(event) => { if event.text == Key.Return || event.text == Key.Space { root.close-find(); return accept; } return reject; }
+                    close-touch := TouchArea { clicked => { root.close-find(); } }
+                }
+            }
+        }
     }
     }
 

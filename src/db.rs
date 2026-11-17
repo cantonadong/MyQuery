@@ -187,6 +187,7 @@ pub async fn execute_limited(client: &Client, sql: &str, mut progress: impl FnMu
     let mut sets: Vec<ResultSet> = Vec::new();
     let mut bytes = 0;
     let mut affected: u64 = 0;
+    let mut statement = 0;
     let mut received = 0;
     let mut has_rowset = false;
     let mut last_progress = Instant::now();
@@ -239,10 +240,13 @@ pub async fn execute_limited(client: &Client, sql: &str, mut progress: impl FnMu
                     set
                 };
                 set.finish()?;
+                set.statements.push(statement);
+                statement += 1;
                 let mut duplicate = false;
                 for previous in &mut sets {
                     if previous.status == set.status && previous.same_content(&mut set)? {
                         previous.repeats += 1;
+                        previous.statements.extend_from_slice(&set.statements);
                         duplicate = true;
                         break;
                     }

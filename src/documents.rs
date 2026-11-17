@@ -1,16 +1,29 @@
 use crate::{AppWindow, I18n, SqlTab, tr};
-use slint::{ComponentHandle, ModelRc, SharedString, StandardListViewItem, TableColumn, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, StandardListViewItem, TableColumn, VecModel};
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
+use serde::{Deserialize, Serialize};
 
+#[derive(Deserialize, Serialize)]
 struct Document {
     id: i32,
     path: Option<PathBuf>,
     text: String,
     saved: String,
     name: Option<String>,
+    #[serde(skip)]
     running: bool,
+    #[serde(skip)]
     results: Option<ResultView>,
+    #[serde(skip)]
+    notice: i32,
+    #[serde(skip)]
+    history: Vec<(String, ResultView)>,
+    #[serde(skip)]
+    history_index: Option<usize>,
+    #[serde(skip)]
+    run_sql: Option<String>,
 }
+#[derive(Clone)]
 struct ResultView {
     captured: std::time::Instant,
     error: SharedString,
@@ -74,24 +87,44 @@ impl Document {
     fn show_results(&self, ui: &AppWindow) {
         crate::clear_results(ui);
         if let Some(results) = &self.results { results.restore(ui); }
+        ui.set_history_count(self.history.len() as i32);
+        ui.set_history_index(self.history_index.map_or(-1, |index| index as i32));
     }
     fn dirty(&self) -> bool {
         self.text != self.saved
     }
 }
-#[derive(Clone, Copy)]
-enum Close {
-    Tab(i32),
-    Window,
-}
+#[derive(Deserialize, Serialize)]
 pub struct Documents {
     tabs: Vec<Document>,
     active: usize,
     next_id: i32,
-    pending: Option<Close>,
-    prompt_id: Option<i32>,
+    #[serde(skip)] pending: Option<i32>,
+    #[serde(skip)] prompt_id: Option<i32>,
+    #[serde(skip)] last_saved: String,
+    #[serde(skip)] persistence_disabled: bool,
+    #[serde(skip)] autosave: slint::Timer,
+    #[serde(skip)] notification: Option<crate::ResultNotification>,
 }
 impl Documents {
+    fn session_path() -> Result<PathBuf, String> {
+        Ok(PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA unavailable")?).join("MyQuery/tabs.json"))
+    }
+    fn persist(&mut self) -> Result<(), String> {
+        use std::io::Write;
+        if self.persistence_disabled { return Err("Tab recovery file could not be loaded; original file preserved".into()); }
+        let data = serde_json::to_string(self).map_err(|error| error.to_string())?;
+        if data == self.last_saved { return Ok(()); }
+        let path = Self::session_path()?;
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(|error| error.to_string())?;
+        temp.write_all(data.as_bytes()).map_err(|error| error.to_string())?;
+        temp.as_file().sync_all().map_err(|error| error.to_string())?;
+        temp.persist(path).map_err(|error| error.to_string())?;
+        self.last_saved = data;
+        Ok(())
+    }
     fn sync(&self, ui: &AppWindow) {
         let tabs = self
             .tabs
@@ -101,9 +134,17 @@ impl Documents {
                 title: doc.title().into(),
                 dirty: doc.dirty(),
                 running: doc.running,
+                notice: doc.notice,
             })
             .collect::<Vec<_>>();
-        ui.set_sql_tabs(Rc::new(VecModel::from(tabs)).into());
+        let model = ui.get_sql_tabs();
+        if model.row_count() == tabs.len() {
+            for (index, tab) in tabs.into_iter().enumerate() {
+                if model.row_data(index).as_ref() != Some(&tab) { model.set_row_data(index, tab); }
+            }
+        } else {
+            ui.set_sql_tabs(Rc::new(VecModel::from(tabs)).into());
+        }
         ui.set_queries_running(self.tabs.iter().any(|doc| doc.running));
         ui.set_active_sql(self.active as i32);
         ui.set_active_document(self.tabs[self.active].id);
@@ -168,6 +209,7 @@ impl Documents {
             name: None,
             running: false,
             results: None,
+            notice: 0, history: Vec::new(), history_index: None, run_sql: None,
             text,
         });
         self.activate(ui, self.tabs.len() - 1);
@@ -193,16 +235,7 @@ impl Documents {
         self.activate(ui, active);
     }
     fn prompt(&mut self, ui: &AppWindow) {
-        let id = match self.pending {
-            Some(Close::Tab(id)) => Some(id),
-            Some(Close::Window) => self.tabs.iter().find(|doc| doc.dirty()).map(|doc| doc.id),
-            None => return,
-        };
-        let Some(id) = id else {
-            self.pending = None;
-            let _ = ui.hide();
-            return;
-        };
+        let Some(id) = self.pending else { return; };
         let Some(index) = self.tabs.iter().position(|doc| doc.id == id) else {
             return;
         };
@@ -238,12 +271,7 @@ impl Documents {
     fn finish_close(&mut self, ui: &AppWindow, id: i32) {
         self.remove(ui, id);
         self.prompt_id = None;
-        match self.pending {
-            Some(Close::Window) => self.prompt(ui),
-            _ => {
-                self.pending = None;
-            }
-        }
+        self.pending = None;
     }
 }
 
@@ -257,19 +285,127 @@ pub fn bind(ui: &AppWindow) -> Rc<RefCell<Documents>> {
             name: None,
             running: false,
             results: None,
+            notice: 0, history: Vec::new(), history_index: None, run_sql: None,
         }],
         active: 0,
         next_id: 2,
         pending: None,
         prompt_id: None,
+        last_saved: String::new(), persistence_disabled: false, autosave: slint::Timer::default(), notification: None,
     }));
-    state.borrow().sync(ui);
+    let loaded = Documents::session_path().and_then(|path| {
+        match std::fs::read(path) {
+            Ok(data) => {
+                let docs: Documents = serde_json::from_slice(&data).map_err(|error| error.to_string())?;
+                let mut ids = std::collections::HashSet::new();
+                if docs.tabs.is_empty() || docs.tabs.len() > 32 || docs.active >= docs.tabs.len()
+                    || docs.tabs.iter().any(|doc| doc.id <= 0 || !ids.insert(doc.id) || doc.id >= docs.next_id) {
+                    return Err("Invalid saved SQL tabs".into());
+                }
+                Ok(Some(docs))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    });
+    match loaded {
+        Ok(Some(docs)) => *state.borrow_mut() = docs,
+        Err(error) => { state.borrow_mut().persistence_disabled = true; ui.set_failed(true); ui.set_status(error.into()); }
+        _ => {}
+    }
+    let active = state.borrow().active;
+    state.borrow_mut().activate(ui, active);
+    let docs = Rc::downgrade(&state);
+    let weak = ui.as_weak();
+    state.borrow().autosave.start(slint::TimerMode::Repeated, std::time::Duration::from_secs(1), move || {
+        if let (Some(docs), Some(ui)) = (docs.upgrade(), weak.upgrade()) {
+            let mut docs = docs.borrow_mut();
+            docs.capture(&ui);
+            if let Err(error) = docs.persist() {
+                ui.set_failed(true);
+                ui.set_status(format!("{}: {error}", tr(ui.global::<I18n>().get_zh(), "标签恢复文件保存失败", "Cannot save tab recovery file")).into());
+            }
+        }
+    });
+    let docs = state.clone();
+    let weak = ui.as_weak();
+    ui.on_run_submitted(move |sql| {
+        if let Some(ui) = weak.upgrade() {
+            let mut docs = docs.borrow_mut();
+            docs.capture(&ui);
+            let active = docs.active;
+            let doc = &mut docs.tabs[active];
+            if let (Some(index), Some(view)) = (doc.history_index, doc.results.clone()) { doc.history[index].1 = view; }
+            doc.run_sql = Some(sql.to_string());
+            doc.notice = 0;
+            docs.sync(&ui);
+        }
+    });
+    let docs = state.clone();
+    let weak = ui.as_weak();
+    ui.on_history_selected(move |id, index| {
+        if let Some(ui) = weak.upgrade() {
+            let mut docs = docs.borrow_mut();
+            docs.capture(&ui);
+            let Some(tab) = docs.tabs.iter().position(|doc| doc.id == id) else { return; };
+            let active = docs.active == tab;
+            let doc = &mut docs.tabs[tab];
+            if let (Some(current), Some(view)) = (doc.history_index, doc.results.clone()) { doc.history[current].1 = view; }
+            let Some((sql, view)) = doc.history.get(index as usize).cloned() else { return; };
+            doc.history_index = Some(index as usize);
+            doc.text = sql.clone();
+            doc.results = Some(view);
+            if active {
+                doc.show_results(&ui);
+                ui.set_failed(false);
+                ui.set_status("".into());
+                ui.set_sql(sql.into());
+            }
+            docs.sync(&ui);
+        }
+    });
+    let docs = state.clone();
+    ui.on_run_not_executed(move |id| {
+        if let Some(doc) = docs.borrow_mut().tabs.iter_mut().find(|doc| doc.id == id) {
+            doc.run_sql = None;
+            doc.history_index = None;
+        }
+    });
+    let docs = state.clone();
+    let weak = ui.as_weak();
+    ui.on_acknowledge_query(move || {
+        if let Some(ui) = weak.upgrade() {
+            let mut docs = docs.borrow_mut();
+            let active = docs.active;
+            if docs.tabs[active].notice != 0 { docs.tabs[active].notice = 0; docs.sync(&ui); }
+        }
+    });
+    let docs = state.clone();
+    ui.on_dismiss_notification(move || {
+        if let Some(notification) = docs.borrow_mut().notification.take() { let _ = notification.hide(); }
+    });
     let docs = state.clone();
     let weak = ui.as_weak();
     ui.on_query_state_changed(move |id, running| {
         if let Some(ui) = weak.upgrade() {
             let mut docs = docs.borrow_mut();
-            if let Some(doc) = docs.tabs.iter_mut().find(|doc| doc.id == id) { doc.running = running; }
+            if let Some(doc) = docs.tabs.iter_mut().find(|doc| doc.id == id) {
+                doc.running = running;
+                if !running {
+                    let view = ResultView::capture(&ui);
+                    doc.notice = if view.phase == 3 { 1 } else { 2 };
+                    if let Some(sql) = doc.run_sql.take() {
+                        doc.history.push((sql, view));
+                        if doc.history.len() > 20 { doc.history.remove(0); }
+                        doc.history_index = Some(doc.history.len() - 1);
+                    }
+                    let status = if ui.get_query_error() == "CANCELLED" { tr(ui.global::<I18n>().get_zh(), "已取消操作", "Operation cancelled") }
+                        else if doc.notice == 1 { tr(ui.global::<I18n>().get_zh(), "成功", "Success") }
+                        else { tr(ui.global::<I18n>().get_zh(), "错误", "Error") };
+                    let message = format!("{} · {status} · {:.2}s", doc.title(), ui.get_query_elapsed());
+                    docs.notification = crate::dialogs::notify_result(&ui, &message);
+                }
+            }
             docs.sync(&ui);
         }
     });
@@ -344,6 +480,7 @@ pub fn bind(ui: &AppWindow) -> Rc<RefCell<Documents>> {
                 return;
             }
             let mut docs = docs.borrow_mut();
+            if index == docs.active as i32 { return; }
             docs.capture(&ui);
             docs.activate(&ui, index as usize);
         }
@@ -371,7 +508,7 @@ pub fn bind(ui: &AppWindow) -> Rc<RefCell<Documents>> {
             docs.capture(&ui);
             if let Some(doc) = docs.tabs.get(index as usize) {
                 let id = doc.id;
-                docs.pending = Some(Close::Tab(id));
+                docs.pending = Some(id);
                 docs.prompt(&ui);
             }
         }
@@ -382,8 +519,10 @@ pub fn bind(ui: &AppWindow) -> Rc<RefCell<Documents>> {
         if let Some(ui) = weak.upgrade() {
             let mut docs = docs.borrow_mut();
             docs.capture(&ui);
-            docs.pending = Some(Close::Window);
-            docs.prompt(&ui);
+            match docs.persist() {
+                Ok(()) => { let _ = ui.hide(); }
+                Err(error) => { ui.set_failed(true); ui.set_status(error.into()); }
+            }
         }
     });
     let docs = state.clone();
@@ -477,6 +616,7 @@ mod tests {
             name: None,
             running: false,
             results: None,
+            notice: 0, history: Vec::new(), history_index: None, run_sql: None,
         };
         assert!(!doc.dirty());
         doc.text = "SELECT 2;".into();

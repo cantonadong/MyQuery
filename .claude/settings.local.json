@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Get-ChildItem 'D:\\\\Program\\\\Rust\\\\rustup\\\\toolchains' | Select-Object Name; Get-ChildItem target\\\\release -File | Select-Object Name, LastWriteTime | Select-Object -First 8; Get-ChildItem env: | Where-Object { $_.Name -match 'LIB|INCLUDE|VC|LINK|CARGO|RUST' } | Format-Table -AutoSize | Out-String -Width 200)",
+      "PowerShell(cargo +stable-x86_64-pc-windows-gnu *)",
+      "PowerShell(git diff --stat; $b = [IO.File]::ReadAllBytes\\('ui\\\\main.slint'\\)[0..2] -join ','; \"slint first bytes: $b\"; git show HEAD:ui/main.slint | Select-Object -First 1 | Format-Hex | Select-Object -First 1)",
+      "PowerShell(git diff *)"
+    ]
+  }
+}

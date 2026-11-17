@@ -70,7 +70,11 @@ pub struct BrowserSelection {
 
 impl Settings {
     pub fn visible_profiles(&self) -> Vec<String> {
-        self.profiles.iter().map(|profile| profile.name.clone()).collect()
+        let mut names = Vec::new();
+        for name in self.browser_scopes.iter().map(|scope| &scope.profile).chain(self.profiles.iter().map(|profile| &profile.name)) {
+            if !names.contains(name) && self.profiles.iter().any(|profile| &profile.name == name) { names.push(name.clone()); }
+        }
+        names
     }
 }
 
@@ -140,6 +144,9 @@ pub fn save(settings: &Settings) -> Result<(), String> {
                         }
                     } else { *existing = item.clone(); }
                 } else { saved.push(item.clone()); }
+            }
+            if key == "browser_scopes" {
+                saved.sort_by_key(|item| incoming.iter().position(|scope| identity(scope) == identity(item)).unwrap_or(incoming.len()));
             }
         } else { merged[key] = value.clone(); }
     }

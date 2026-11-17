@@ -36,6 +36,8 @@ fn number_key(value: &str) -> Option<(i8, i64, String)> {
 }
 
 pub struct ResultSet {
+    pub name: String,
+    pub statements: Vec<usize>,
     pub repeats: usize,
     pub status: bool,
     pub exported: bool,
@@ -52,6 +54,8 @@ impl ResultSet {
         let file = tempfile::tempfile().map_err(|e| e.to_string())?;
         let writer = BufWriter::new(file.try_clone().map_err(|e| e.to_string())?);
         Ok(Self {
+            name: String::new(),
+            statements: Vec::new(),
             repeats: 1,
             status: false,
             exported: false,

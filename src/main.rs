@@ -237,6 +237,7 @@ enum Command {
     CloseDocument(i32),
     CloseResult(usize, usize, usize),
     Run(String, u64),
+    History(usize),
     Page(usize, usize),
     Sort(usize, usize, bool),
     Copy(usize, Option<usize>, Option<Vec<usize>>, Option<Vec<(usize, usize)>>, bool),
@@ -314,7 +315,7 @@ impl Finish {
             fields_request: matches!(command, Command::Fields(_, _, action) if action != "completion"),
             browser_refresh: matches!(command, Command::Refresh | Command::RefreshSchema),
             notify_success: matches!(command, Command::Fields(_, _, action) if action == "copy-structure") || !matches!(command,
-                Command::Run(..) | Command::Page(..) | Command::Tables(..) |
+                Command::Run(..) | Command::History(..) | Command::Page(..) | Command::Tables(..) |
                 Command::Fields(..) | Command::ScopeChoices(..) | Command::OpenScopes |
                 Command::LoadProfile(..) | Command::UseProfile(..)),
             prefetch: matches!(command, Command::Connect(..) | Command::UseProfile(..) | Command::Reconnect),
@@ -399,7 +400,7 @@ fn is_switch(command: &Command) -> bool {
 }
 /// Commands that only touch SQL tabs or held results; allowed while a switch is running.
 fn is_result_command(command: &Command) -> bool {
-    matches!(command, Command::Run(..) | Command::Cancel(..) | Command::Page(..) | Command::Sort(..) | Command::Copy(..)
+    matches!(command, Command::Run(..) | Command::History(..) | Command::Cancel(..) | Command::Page(..) | Command::Sort(..) | Command::Copy(..)
         | Command::CopyCell(..) | Command::Export(..) | Command::CloseResult(..) | Command::ImportSql | Command::SaveSql(..))
 }
 
@@ -739,8 +740,9 @@ impl Worker {
         } else {
             scopes.iter().map(|scope| scope.database.clone()).collect()
         };
-        databases.sort();
-        databases.dedup();
+        if scopes.is_empty() { databases.sort(); }
+        let mut seen = std::collections::HashSet::new();
+        databases.retain(|name| seen.insert(name.clone()));
         let redshift = self
             .active
             .as_ref()
@@ -755,8 +757,9 @@ impl Worker {
         } else {
             scopes.iter().filter(|scope| scope.database == profile.database).map(|scope| scope.schema.clone()).collect()
         };
-        schemas.sort();
-        schemas.dedup();
+        if scopes.is_empty() { schemas.sort(); }
+        seen.clear();
+        schemas.retain(|name| seen.insert(name.clone()));
         let restored = self
             .settings
             .last_selection
@@ -1093,7 +1096,7 @@ impl Worker {
                     if !confirmed { return Ok(String::new()); }
                 }
                 if index < self.sets.len() { self.sets.remove(index); }
-                let names = self.sets.iter().enumerate().map(|(i, set)| if set.repeats > 1 { format!("{} × {}", i + 1, set.repeats) } else { (i + 1).to_string() }).collect();
+                let names = self.sets.iter().enumerate().map(|(i, set)| if !set.name.is_empty() { set.name.clone() } else if set.repeats > 1 { format!("{} × {}", i + 1, set.repeats) } else { (i + 1).to_string() }).collect();
                 update_result(&self.ui, self.result_tab, move |ui| {
                     let elapsed = ui.get_query_elapsed();
                     let phase = ui.get_query_phase();
@@ -1419,11 +1422,13 @@ impl Worker {
                         &format!("Statement {index} references several connections ({}); a statement can query only one connection.", names.join(", "))),
                 })?;
                 let deadline = Instant::now() + Duration::from_secs(timeout);
+                let mut result_labels = syntax::dq_labels(&sql, &mut 0).into_iter();
                 let several = batches.len() > 1;
                 self.sets.clear();
                 let mut sets: Vec<ResultSet> = Vec::new();
                 let mut received = 0;
                 for batch in batches {
+                    let labels: Vec<_> = result_labels.by_ref().take(syntax::dq_labels(&batch.sql, &mut 0).len()).collect();
                     let remaining = deadline.saturating_duration_since(Instant::now()).as_secs().max(1);
                     let primary = self.active.as_ref().is_some_and(|(profile, _)| profile.name == batch.connection);
                     let client = if primary { self.prepare_session().await? } else { self.route_client(&batch.connection).await? };
@@ -1444,7 +1449,16 @@ impl Worker {
                     )
                     .await;
                     match result {
-                        Ok((batch_sets, _)) => {
+                        Ok((mut batch_sets, _)) => {
+                            for set in &mut batch_sets {
+                                let mut names = Vec::new();
+                                for &statement in &set.statements {
+                                    if let Some(label) = labels.get(statement).filter(|label| !label.is_empty()) {
+                                        names.push(label.clone());
+                                    }
+                                }
+                                set.name = names.join(" / ");
+                            }
                             received += batch_sets.iter().filter(|set| !set.status).map(|set| set.count).sum::<usize>();
                             sets.extend(batch_sets);
                             if sets.len() > 32 { return Err("LIMIT_COLUMNS".into()); }
@@ -1460,7 +1474,7 @@ impl Worker {
                 }
                 self.sets = sets;
                 let names = self.sets.iter().enumerate()
-                    .map(|(i, set)| if set.repeats > 1 { format!("{} × {}", i + 1, set.repeats) } else { (i + 1).to_string() })
+                    .map(|(i, set)| if !set.name.is_empty() { set.name.clone() } else if set.repeats > 1 { format!("{} × {}", i + 1, set.repeats) } else { (i + 1).to_string() })
                     .collect();
                 update_result(&self.ui, self.result_tab, move |ui| ui.set_result_names(strings(names)));
                 if !self.sets.is_empty() {
@@ -1468,6 +1482,7 @@ impl Worker {
                 }
                 Ok(String::new())
             }
+            Command::History(_) => Ok(String::new()),
             Command::Sort(index, column, descending) => {
                 let cancelled = self.cancelled.clone();
                 self.sets.get_mut(index).ok_or("No result set")?.sort(column, descending, || cancelled.load(Ordering::Relaxed))?;
@@ -1777,8 +1792,8 @@ fn explain(zh: bool, error: String) -> String {
         ),
         "CANCELLED" => tr(
             zh,
-            "已取消操作；数据库操作会断开会话。已提交的修改不会撤销。",
-            "Cancelled; database operations disconnect the session. Committed changes are not undone.",
+            "已取消操作",
+            "Operation cancelled",
         ),
         "LIMIT_RESULT" => tr(
             zh,
@@ -1828,10 +1843,11 @@ fn submit(
     let zh = ui.global::<I18n>().get_zh();
     cancelled.store(false, Ordering::Relaxed);
     let browser_refresh = match &command { Command::Refresh => 1, Command::RefreshSchema => 2, _ => 0 };
+    let run_sql = if let Command::Run(sql, _) = &command { Some(sql.clone()) } else { None };
     match tx.try_send(Request { command, zh, started: Instant::now(), document_id: ui.get_active_document(), open_documents: ui.get_sql_tabs().iter().map(|tab| tab.id).collect() }) {
         Ok(()) => {
             if reconnect { ui.set_reconnecting(true); }
-            if query { clear_results(ui); ui.invoke_query_started(); ui.invoke_query_state_changed(ui.get_active_document(), true); }
+            if query { ui.invoke_run_submitted(run_sql.unwrap().into()); clear_results(ui); ui.invoke_query_started(); ui.invoke_query_state_changed(ui.get_active_document(), true); }
             if switch { ui.set_switching(true); }
             else if !query && !cancel_request && !field_selection { ui.set_busy(true); }
             if browser_refresh != 0 { ui.set_browser_refresh(browser_refresh); }
@@ -1847,6 +1863,7 @@ fn submit(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    slint::BackendSelector::new().with_winit_window_attributes_hook(|attributes| attributes.with_active(false)).select()?;
     let ui = AppWindow::new()?;
     ui.on_format_count(|count| {
         let mut formatted = String::new();
@@ -1855,6 +1872,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             formatted.push(digit);
         }
         formatted.into()
+    });
+    ui.on_selection_size(|selected_rows, selected_cells, column_count| {
+        let columns = column_count.max(0) as usize;
+        if columns == 0 { return SelectionSize::default(); }
+        let mut rows = std::collections::HashSet::new();
+        let mut fields = std::collections::HashSet::new();
+        for (row, selected) in selected_rows.iter().enumerate() {
+            if selected { rows.insert(row); fields.extend(0..columns); }
+        }
+        for (cell, selected) in selected_cells.iter().enumerate() {
+            if selected { rows.insert(cell / columns); fields.insert(cell % columns); }
+        }
+        SelectionSize { rows: rows.len() as i32, columns: fields.len() as i32 }
     });
     let document_state = documents::bind(&ui);
     let (settings, error) = match config::load() {
@@ -1974,6 +2004,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let mut queries = tokio::task::JoinSet::<(i32, Worker, Result<String, String>, Instant)>::new();
                 let mut sessions = std::collections::HashMap::<i32, TabSessions>::new();
+                let mut histories = std::collections::HashMap::<i32, (std::collections::VecDeque<Vec<ResultSet>>, usize)>::new();
                 // Connection/browser changes run here; runs submitted meanwhile wait in `pending`.
                 let mut switches = tokio::task::JoinSet::<(Worker, Result<String, String>, Finish)>::new();
                 let mut pending: Vec<Request> = Vec::new();
@@ -1991,6 +2022,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 cancellations.remove(&id);
                                 if !open_documents.contains(&id) { continue; }
                                 sessions.insert(id, TabSessions { session: query.session.take(), profile: query.session_profile.take(), routes: std::mem::take(&mut query.routes) });
+                                let previous = if worker.result_tab == id { std::mem::take(&mut worker.sets) } else { worker.tab_sets.remove(&id).unwrap_or_default() };
+                                let (history, selected) = histories.entry(id).or_default();
+                                if let Some(slot) = history.get_mut(*selected) { *slot = previous; }
+                                history.push_back(Vec::new());
+                                if history.len() > 20 { history.pop_front(); }
+                                *selected = history.len() - 1;
                                 if worker.result_tab == id { worker.sets = std::mem::take(&mut query.sets); }
                                 else { worker.tab_sets.insert(id, std::mem::take(&mut query.sets)); }
                                 let elapsed = started.elapsed().as_secs_f32();
@@ -2091,6 +2128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Command::CloseDocument(id) = &request.command {
                         open_documents.remove(id);
                         sessions.remove(id);
+                        histories.remove(id);
                         worker.tab_sets.remove(id);
                         if worker.result_tab == *id { worker.sets.clear(); }
                         if let Some(cancel) = cancellations.get(id) { cancel.store(true, Ordering::Relaxed); }
@@ -2103,6 +2141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let queued = pending.remove(index);
                             let (id, elapsed) = (*id, queued.started.elapsed().as_secs_f32());
                             update_result(&worker.ui, id, move |ui| {
+                                ui.invoke_run_not_executed(id);
                                 ui.set_query_running(false);
                                 ui.set_query_elapsed(elapsed);
                                 ui.set_query_phase(4);
@@ -2151,6 +2190,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         worker.result_tab = request.document_id;
                     }
                     worker.tab_sets.retain(|id, _| request.open_documents.contains(id));
+                    histories.retain(|id, _| request.open_documents.contains(id));
+                    if let Command::History(index) = &request.command {
+                        if let Some((history, selected)) = histories.get_mut(&request.document_id) {
+                            if *index < history.len() {
+                                history[*selected] = std::mem::take(&mut worker.sets);
+                                worker.sets = std::mem::take(&mut history[*index]);
+                                *selected = *index;
+                                let index = *index as i32;
+                                let id = request.document_id;
+                                update(&worker.ui, move |ui| ui.invoke_history_selected(id, index));
+                            }
+                        }
+                    }
                     worker.zh = request.zh;
                     let finish = Finish::new(&request.command);
                     let result = worker.handle(request.command).await;
@@ -2317,6 +2369,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui.get_sql().to_string(),
                 ui.get_timeout().clamp(1, 3600) as u64 * 60,
             )),
+            "history-prev" => Ok(Command::History(ui.get_history_index().saturating_sub(1).max(0) as usize)),
+            "history-next" => Ok(Command::History((ui.get_history_index() + 1).max(0) as usize)),
             "import" => Ok(Command::ImportSql),
             "save-sql" => Ok(Command::SaveSql(ui.get_sql().to_string(), ui.get_document_title().to_string())),
             "export" => Ok(Command::Export(ui.get_result_index() as usize)),
@@ -2389,6 +2443,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         use slint::Model;
         if let Some(ui) = weak.upgrade() {
             let scopes: Vec<_> = ui.get_browser_scopes().iter().enumerate().filter_map(|(row, scope)| (row != index as usize).then_some(scope)).collect();
+            ui.set_browser_scopes(std::rc::Rc::new(VecModel::from(scopes)).into());
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_move_scope(move |from, to| {
+        if let Some(ui) = weak.upgrade() {
+            let mut scopes: Vec<_> = ui.get_browser_scopes().iter().collect();
+            let (from, to) = (from as usize, to as usize);
+            if from >= scopes.len() || to >= scopes.len() || from == to { return; }
+            let scope = scopes.remove(from);
+            scopes.insert(to, scope);
             ui.set_browser_scopes(std::rc::Rc::new(VecModel::from(scopes)).into());
         }
     });
@@ -2670,7 +2735,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     ui.on_result_column_selected({
         let weak = ui.as_weak();
-        move |column, control| {
+        move |column, shift, control| {
             let Some(ui) = weak.upgrade() else { return; };
             let rows = ui.get_result_rows().row_count();
             let columns = ui.get_result_columns().row_count();
@@ -2678,12 +2743,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if column >= columns || rows == 0 { return; }
             let mut selected: Vec<_> = ui.get_selected_cells().iter().collect();
             selected.resize(rows * columns, false);
-            let select = !control || !(0..rows).all(|row| selected[row * columns + column]);
+            let anchor = if shift { ui.get_cell_anchor_column().max(0) as usize } else { column };
+            let select = shift || !control || !(0..rows).all(|row| selected[row * columns + column]);
             if !control { selected.fill(false); }
-            for row in 0..rows { selected[row * columns + column] = select; }
+            for row in 0..rows { selected[row * columns + anchor.min(column)..=row * columns + anchor.max(column)].fill(select); }
             ui.set_selected_rows(ModelRc::default());
             ui.set_selection_anchor(0);
-            ui.set_cell_anchor_column(column as i32);
+            if !shift { ui.set_cell_anchor_column(column as i32); }
             ui.set_selected_count(selected.iter().filter(|selected| **selected).count() as i32);
             ui.set_selected_cells(std::rc::Rc::new(VecModel::from(selected)).into());
         }
@@ -2824,7 +2890,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         submit(&ui, &tx, &cancelled, Command::UseProfile(index));
     }
     let _dialogs = dialogs::bind(&ui);
+    {
+        use slint::winit_030::{WinitWindowAccessor, EventResult, winit::event::{WindowEvent, ElementState, TouchPhase, Touch}};
+        let weak = ui.as_weak();
+        ui.window().on_winit_window_event(move |_, event| {
+            if matches!(event, WindowEvent::Focused(true)) {
+                if let Some(ui) = weak.upgrade() { ui.invoke_dismiss_notification(); }
+            }
+            if matches!(event, WindowEvent::MouseInput { state: ElementState::Pressed, .. } | WindowEvent::Touch(Touch { phase: TouchPhase::Started, .. })) {
+                if let Some(ui) = weak.upgrade() { ui.invoke_acknowledge_query(); }
+            }
+            EventResult::Propagate
+        });
+    }
     ui.show()?;
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(dialogs::native_window(&ui.get_window_title())); }
     if saved_maximized {
         let weak = ui.as_weak();
         slint::Timer::single_shot(Duration::from_millis(100), move || {

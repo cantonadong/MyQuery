@@ -214,7 +214,7 @@ export component DenseTable inherits Rectangle {
     callback cell-selected(int, int, bool, bool);
     callback cell-double-clicked(int, int);
     callback column-at(float) -> int;
-    callback column-selected(int, bool);
+    callback column-selected(int, bool, bool);
     callback select-all();
     callback copy-selection();
     background: Theme.surface;
@@ -272,18 +272,29 @@ export component DenseTable inherits Rectangle {
                     for column[index] in root.columns: Rectangle {
                         accessible-role: button;
                         accessible-label: column.title;
-                        accessible-action-default => { if root.multi-select { root.column-selected(index, false); } }
+                        accessible-action-default => { if root.multi-select { root.column-selected(index, false, false); } }
                         width: column.width > 0px ? column.width : 160px;
                         clip: true;
                         Text { x: 5px; width: parent.width - (root.sortable ? 32px : 10px); height: parent.height; text: column.title; font-size: 12px; color: Theme.text; vertical-alignment: center; overflow: elide; }
                         Rectangle { x: parent.width - 1px; width: 1px; background: Theme.table-border; }
                         header-touch := TouchArea {
+                            private property <bool> drag-control;
                             width: parent.width - 5px;
                             enabled: root.multi-select;
+                            moved => {
+                                if self.pressed {
+                                    let x = parent.x + self.mouse-x + list.content-x;
+                                    if x < 0px { list.content-x = min(0px, list.content-x - x); }
+                                    if x > list.visible-width { list.content-x = max(min(0px, list.visible-width - list.content-width), list.content-x - (x - list.visible-width)); }
+                                    root.current-column = root.column-at((parent.x + self.mouse-x) / 1px);
+                                    root.column-selected(root.current-column, true, self.drag-control);
+                                }
+                            }
                             pointer-event(event) => {
                                 if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                    self.drag-control = event.modifiers.control;
                                     keys.focus(); root.current-row = 0; root.current-column = index;
-                                    root.column-selected(index, event.modifiers.control);
+                                    root.column-selected(index, event.modifiers.shift, event.modifiers.control);
                                 }
                             }
                         }
@@ -334,7 +345,7 @@ export component DenseTable inherits Rectangle {
                 for row[index] in root.rows: Rectangle {
                     height: 22px;
                     width: list.content-width;
-                    background: (root.multi-select ? root.selected-rows[index] : root.current-row == index) ? Theme.selected : Math.mod(index, 2) == 0 ? Theme.surface : Theme.alternate;
+                    background: Math.mod(index, 2) == 0 ? Theme.surface : Theme.alternate;
                     accessible-role: list-item;
                     accessible-item-selected: root.multi-select ? root.selected-rows[index] : root.current-row == index;
                     accessible-action-default => { root.select(index, false, false); }
@@ -344,31 +355,35 @@ export component DenseTable inherits Rectangle {
                             width: 42px; background: Theme.panel;
                             Text { text: root.row-offset + index + 1; color: Theme.muted; horizontal-alignment: center; vertical-alignment: center; }
                             TouchArea {
+                                private property <bool> drag-control;
+                                moved => { if self.pressed { root.select(index + floor(self.mouse-y / 22px), true, self.drag-control); } }
                                 pointer-event(event) => {
-                                    if event.button == PointerEventButton.left && event.kind == PointerEventKind.down { keys.focus(); root.select(index, event.modifiers.shift, event.modifiers.control); }
+                                    if event.button == PointerEventButton.left && event.kind == PointerEventKind.down { self.drag-control = event.modifiers.control; keys.focus(); root.select(index, event.modifiers.shift, event.modifiers.control); }
                                 }
                             }
                         }
                         for cell[column] in row: Rectangle {
                             width: root.columns[column].width > 0px ? root.columns[column].width : 160px;
                             clip: true;
-                            background: root.selected-cells[index * root.columns.length + column] ? Theme.selected : transparent;
+                            background: (root.multi-select ? root.selected-rows[index] : root.current-row == index) || root.selected-cells[index * root.columns.length + column] ? Theme.selected : transparent;
                             accessible-role: list-item;
                             accessible-label: root.columns[column].title + ": " + cell.text;
                             accessible-item-selected: root.selected-cells[index * root.columns.length + column] || root.selected-rows[index];
                             Text { x: 5px; width: parent.width - 10px; height: parent.height; text: cell.text; font-size: 12px; color: Theme.text; vertical-alignment: center; overflow: elide; }
                             TouchArea {
+                                private property <bool> drag-control;
                                 double-clicked => { root.cell-double-clicked(index, column); }
                                 moved => {
                                     if self.pressed && root.multi-select {
                                         let x = parent.x + self.mouse-x + list.content-x;
                                         if x < 0px { list.content-x = min(0px, list.content-x - x); }
                                         if x > list.visible-width { list.content-x = max(min(0px, list.visible-width - list.content-width), list.content-x - (x - list.visible-width)); }
-                                        root.select-cell(index + floor(self.mouse-y / 22px), root.column-at((parent.x + self.mouse-x) / 1px), true, false);
+                                        root.select-cell(index + floor(self.mouse-y / 22px), root.column-at((parent.x + self.mouse-x) / 1px), true, self.drag-control);
                                     }
                                 }
                                 pointer-event(event) => {
                                     if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                        self.drag-control = event.modifiers.control;
                                         keys.focus();
                                         if root.multi-select { root.select-cell(index, column, event.modifiers.shift, event.modifiers.control); }
                                         else { root.select(index, false, false); }

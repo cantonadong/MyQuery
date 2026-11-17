@@ -101,7 +101,7 @@ pub fn tokens(sql: &str) -> Vec<(Range<usize>, &'static str)> {
 }
 
 pub fn highlight(sql: &str) -> Vec<Vec<crate::SqlRun>> {
-    if sql.len() > 64 * 1024 || sql.bytes().filter(|b| *b == b'\n').count() >= 500 {
+    if sql.len() > 2 * 1024 * 1024 {
         return Vec::new();
     }
     let sql = sql.replace("\r\n", "\n").replace('\r', "\n");
@@ -130,6 +130,37 @@ pub fn highlight(sql: &str) -> Vec<Vec<crate::SqlRun>> {
     lines
 }
 
+pub fn dq_labels(sql: &str, number: &mut usize) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut label = String::new();
+    let mut code = false;
+    for (range, color) in tokens(sql) {
+        let text = &sql[range];
+        if color == "#738276" {
+            if !code {
+                for line in text.lines() {
+                    let comment = line.trim_start_matches(['-', '/', '*', ' ', '\t', '\r', '\n']);
+                    if comment.get(..2).is_some_and(|prefix| prefix.eq_ignore_ascii_case("dq"))
+                        && comment[2..].chars().next().is_none_or(|c| !c.is_alphabetic() && c != '_') {
+                        *number += 1;
+                        let explicit: String = comment[2..].trim_start_matches([' ', '\t', ':', '#', '-']).chars().take_while(char::is_ascii_digit).collect();
+                        label = format!("DQ {}", if explicit.is_empty() { number.to_string() } else { explicit });
+                    }
+                }
+            }
+        } else if color == "#243447" {
+            for ch in text.chars() {
+                if ch == ';' {
+                    if code { labels.push(std::mem::take(&mut label)); }
+                    code = false;
+                } else if !ch.is_whitespace() { code = true; }
+            }
+        } else { code = true; }
+    }
+    if code { labels.push(label); }
+    labels
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,7 +183,7 @@ mod tests {
                 .iter()
                 .any(|(range, color)| &sql[range.clone()] == "$$a\nb$$" && *color == "#238047")
         );
-        assert!(highlight(&"a".repeat(65537)).is_empty());
+        assert!(highlight(&"a".repeat(2 * 1024 * 1024 + 1)).is_empty());
     }
 
     #[test]

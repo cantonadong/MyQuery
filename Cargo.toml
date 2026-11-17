@@ -1,6 +1,6 @@
 [package]
 name = "sql-desk"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 build = "build.rs"
 
@@ -9,7 +9,7 @@ name = "myquery_core"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-slint = { version = "1.15", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2"] }
+slint = { version = "1.15", default-features = false, features = ["std", "backend-winit", "unstable-winit-030", "renderer-software", "compat-1-2"] }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 tokio-postgres = "0.7"
 native-tls = "0.2"
@@ -23,7 +23,7 @@ rfd = "0.15"
 arboard = { version = "3", default-features = false }
 keyring = { version = "3", features = ["windows-native"] }
 sys-locale = "0.3"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Cryptography", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
 
 [build-dependencies]
 slint-build = "1.15"

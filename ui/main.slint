@@ -7,10 +7,11 @@ import { ActionButton, SelectBox, PopupMenu } from "controls.slint";
 import { DenseList, DenseTable, FadeScrollBar, SearchCombo } from "dense-widgets.slint";
 
 export struct DbObject { name: string, kind: int }
-export struct SqlTab { id: int, title: string, dirty: bool, running: bool }
+export struct SqlTab { id: int, title: string, dirty: bool, running: bool, notice: int }
 export struct BrowserScope { profile: string, database: string, schema: string }
 export struct ScopeChoice { profile: string, database: string, schema: string, selected: bool }
 export struct FieldRow { name: string, datatype: string, added: bool }
+export struct SelectionSize { rows: int, columns: int }
 
 export global I18n {
     in-out property <bool> zh: true;
@@ -221,6 +222,13 @@ export component AppWindow inherits Window {
     in-out property <int> scope-schema-index: -1;
     in-out property <[string]> result-names;
     in-out property <int> result-index: -1;
+    in-out property <int> history-index: -1;
+    in-out property <int> history-count;
+    callback run-submitted(string);
+    callback history-selected(int, int);
+    callback run-not-executed(int);
+    callback acknowledge-query();
+    callback dismiss-notification();
     in-out property <[TableColumn]> result-columns;
     in-out property <bool> result-status;
     in-out property <[[StandardListViewItem]]> result-rows;
@@ -232,6 +240,8 @@ export component AppWindow inherits Window {
     in-out property <[bool]> selected-cells;
     in-out property <int> cell-anchor-column: -1;
     in-out property <int> selected-count;
+    pure callback selection-size([bool], [bool], int) -> SelectionSize;
+    private property <SelectionSize> selected-size: root.selection-size(root.selected-rows, root.selected-cells, root.result-columns.length);
     in-out property <int> selection-anchor: -1;
     in-out property <bool> copy-headers: true;
     in-out property <bool> query-running;
@@ -259,7 +269,7 @@ export component AppWindow inherits Window {
     callback result-cell-selected(int, int, bool, bool);
     callback result-cell-double-clicked(int, int);
     callback result-column-at(float) -> int;
-    callback result-column-selected(int, bool);
+    callback result-column-selected(int, bool, bool);
     in-out property <[DbObject]> hidden-objects;
     in-out property <bool> show-hidden;
     callback result-select-all();
@@ -270,6 +280,7 @@ export component AppWindow inherits Window {
     column-metric := Text { visible: false; font-size: 12px; wrap: no-wrap; }
     callback action(string);
     callback remove-scope(int);
+    callback move-scope(int, int);
     callback scope-choice(int, int, bool);
     callback prefix-selected(int);
     callback filter-group();
@@ -467,6 +478,7 @@ export component AppWindow inherits Window {
                         field-touch := TouchArea {
                             mouse-cursor: ns-resize;
                             clicked => { field-focus.focus(); }
+                            double-clicked => { root.field-ratio = 0.25; }
                             moved => { if self.pressed { root.field-ratio = (1 - (browser-area.height + self.mouse-y - self.pressed-y) / max(1px, sidebar-layout.height - 13px)).clamp(0.12, 0.55); } }
                         }
                     }
@@ -607,7 +619,12 @@ export component AppWindow inherits Window {
                                 border-top-left-radius: Theme.control-radius; border-top-right-radius: Theme.control-radius;
                                 Rectangle { x: 1px; y: parent.height - 1px; width: parent.width - 2px; height: 1px; background: parent.background; }
                                 if tab.running: LoadingIndicator { x: 4px; }
-                                tab-label := Text { x: tab.running ? 26px : 6px; width: parent.width - self.x - 26px; height: parent.height; text: (tab.dirty ? "* " : "") + tab.title; font-size: 12px; color: Theme.heading; vertical-alignment: center; overflow: elide; wrap: no-wrap; }
+                                if !tab.running && tab.notice != 0: Path {
+                                    x: 5px; y: 4px; width: 16px; height: 16px; viewbox-width: 16; viewbox-height: 16;
+                                    stroke: tab.notice == 1 ? Theme.positive : Theme.negative; stroke-width: 2px; fill: transparent;
+                                    commands: tab.notice == 1 ? "M 2 8 L 6 12 L 14 3" : "M 3 3 L 13 13 M 13 3 L 3 13";
+                                }
+                                tab-label := Text { x: tab.running || tab.notice != 0 ? 26px : 6px; width: parent.width - self.x - 26px; height: parent.height; text: (tab.dirty ? "* " : "") + tab.title; font-size: 12px; color: Theme.heading; vertical-alignment: center; overflow: elide; wrap: no-wrap; }
                                 tab-focus := FocusScope {
                                     x: 0px; y: 0px; width: 100%; height: 100%; enabled: !root.document-saving && !root.save-prompt-open;
                                     key-pressed(event) => {
@@ -625,6 +642,7 @@ export component AppWindow inherits Window {
                                             mouse-cursor: self.pressed ? grabbing : default;
                                             moved => { if self.pressed && abs(self.mouse-x - self.pressed-x) > 5px { self.dragging = true; root.sql-tab-drag-x = sql-tab.x + self.mouse-x; } }
                                             clicked => { if !self.dragging { tab-focus.focus(); root.sql-selected(index); } }
+                                            double-clicked => { if !self.dragging { root.rename-sql-index = index; root.rename-sql-text = tab.title; root.rename-sql-open = true; } }
                                             pointer-event(event) => {
                                                 if event.button == PointerEventButton.middle && event.kind == PointerEventKind.up { root.close-sql(index); }
                                                 if event.button == PointerEventButton.right && event.kind == PointerEventKind.down { tab-menu.show({ x: self.mouse-x, y: self.mouse-y }); }
@@ -703,6 +721,7 @@ export component AppWindow inherits Window {
                         result-touch := TouchArea {
                             mouse-cursor: ns-resize;
                             clicked => { result-focus.focus(); }
+                            double-clicked => { root.split-ratio = 0.5; }
                             moved => { if self.pressed { root.split-ratio = ((sql-area.height + self.mouse-y - self.pressed-y) / max(1px, pane-layout.height - 13px)).clamp(0.25, 0.75); } }
                         }
                     }
@@ -722,7 +741,7 @@ export component AppWindow inherits Window {
                             result-tab-strip := HorizontalBox {
                                 x: 0px; y: 0px; padding: 0px; spacing: Theme.control-gap; alignment: start; height: 24px;
                                 for name[index] in root.result-names: ObjectTab {
-                                    text: I18n.t("结果", "Result") + " " + name; width: 88px; horizontal-stretch: 0; enabled: !root.busy; tab-style: true;
+                                    text: name.starts-with("DQ ") ? name : I18n.t("结果", "Result") + " " + name; width: 88px; horizontal-stretch: 0; enabled: !root.busy; tab-style: true;
                                     selected: index == root.result-index;
                                     clicked => { root.result-selected(index); }
                                     middle-clicked => { root.close-result(index); }
@@ -737,9 +756,11 @@ export component AppWindow inherits Window {
                             width: 24px;
                             VerticalLayout {
                                 spacing: Theme.control-gap; alignment: start;
-                                IconButton { icon: @image-url("icons/copy.svg"); accessible-label: I18n.t("复制", "Copy"); enabled: root.displayed-error != "" || (!root.busy && root.result-index >= 0); clicked => { root.action(root.displayed-error != "" ? "copy-error" : "copy-all"); } Tooltip { text: @markdown("\{I18n.t("复制", "Copy")}"); } }
-                                IconButton { icon: @image-url("icons/export.svg"); accessible-label: I18n.t("导出", "Export"); enabled: !root.busy && root.result-index >= 0; clicked => { root.action("export"); } Tooltip { text: @markdown("\{I18n.t("导出", "Export")}"); } }
                                 IconButton { icon: root.copy-headers ? @image-url("icons/headers.svg") : @image-url("icons/headers-off.svg"); checked: root.copy-headers; accessible-label: I18n.t("复制标题行", "Copy headers"); accessible-checkable: true; accessible-checked: root.copy-headers; clicked => { root.copy-headers = !root.copy-headers; } Tooltip { text: @markdown("\{I18n.t("复制标题行", "Copy headers")}"); } }
+                                IconButton { icon: @image-url("icons/export.svg"); accessible-label: I18n.t("导出", "Export"); enabled: !root.busy && root.result-index >= 0; clicked => { root.action("export"); } Tooltip { text: @markdown("\{I18n.t("导出", "Export")}"); } }
+                                IconButton { icon: @image-url("icons/copy.svg"); accessible-label: I18n.t("复制", "Copy"); enabled: root.displayed-error != "" || (!root.busy && root.result-index >= 0); clicked => { root.action(root.displayed-error != "" ? "copy-error" : "copy-all"); } Tooltip { text: @markdown("\{I18n.t("复制", "Copy")}"); } }
+                                CompactButton { width: 24px; text: "<"; accessible-label: I18n.t("上一次执行", "Previous run"); enabled: !root.busy && !root.query-running && root.history-index > 0; clicked => { root.action("history-prev"); } }
+                                CompactButton { width: 24px; text: ">"; accessible-label: I18n.t("下一次执行", "Next run"); enabled: !root.busy && !root.query-running && root.history-index + 1 < root.history-count; clicked => { root.action("history-next"); } }
                                 if root.displayed-error != "" && root.result-index >= 0: IconButton {
                                     icon: @image-url("icons/return-data.svg"); accessible-label: I18n.t("返回数据结果", "Return to results"); enabled: !root.query-running;
                                     clicked => { root.failed = false; root.query-error = ""; }
@@ -764,7 +785,7 @@ export component AppWindow inherits Window {
                     cell-selected(row, column, shift, control) => { root.result-cell-selected(row, column, shift, control); }
                     cell-double-clicked(row, column) => { if !root.busy { root.result-cell-double-clicked(row, column); } }
                     column-at(x) => { return root.result-column-at(x); }
-                    column-selected(column, control) => { root.result-column-selected(column, control); }
+                    column-selected(column, shift, control) => { root.result-column-selected(column, shift, control); }
                     select-all => { root.result-select-all(); }
                     copy-selection => { if !root.busy && root.selected-count > 0 { root.action("copy-row"); } }
                 }
@@ -799,14 +820,14 @@ export component AppWindow inherits Window {
                             spacing: 4px;
                             query-info := Caption {
                                 min-width: 0px; horizontal-stretch: 1; overflow: elide;
-                                text: !root.query-running && root.query-has-run ? root.phase-text + " · " + I18n.t("耗时 ", "Elapsed ") + root.elapsed-text + (root.result-index >= 0 ? " · " + I18n.t("已读取 ", "Rows read: ") + root.format-count(root.row-count) : "") : "";
+                                text: !root.query-running && root.query-has-run ? root.phase-text + " · " + I18n.t("耗时 ", "Elapsed ") + root.elapsed-text + (root.result-index >= 0 ? " · " + I18n.t("已读取 ", "Rows read: ") + root.format-count(root.row-count) : "") + (root.selected-count > 0 ? " · " + I18n.t("已选 ", "Selected: ") + root.selected-size.rows + I18n.t(" 行 × ", " rows × ") + root.selected-size.columns + I18n.t(" 列", " columns") : "") : "";
                                 Tooltip { text: @markdown("\{query-info.text}"); }
                             }
                         }
                     }
                     HorizontalBox { spacing: Theme.control-gap;
                         padding: 0px; alignment: start; horizontal-stretch: 0;
-                        CompactButton { height: 24px; text: I18n.t("上一页", "Previous"); enabled: !root.busy && root.page > 0; clicked => { root.change-page(root.page - 1); } }
+                        CompactButton { height: 24px; text: I18n.t("上一页", "Previous"); enabled: !root.busy && root.pages > 1; clicked => { root.change-page(mod(root.page + root.pages - 1, root.pages)); } }
                         Rectangle {
                             width: 64px; height: 24px; horizontal-stretch: 0;
                             border-radius: Theme.control-radius; border-width: 1px;
@@ -832,7 +853,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         Caption { text: " / " + root.pages; }
-                        CompactButton { height: 24px; text: I18n.t("下一页", "Next"); enabled: !root.busy && root.page + 1 < root.pages; clicked => { root.change-page(root.page + 1); } }
+                        CompactButton { height: 24px; text: I18n.t("下一页", "Next"); enabled: !root.busy && root.pages > 1; clicked => { root.change-page(mod(root.page + 1, root.pages)); } }
                     }
                     Rectangle {
                         min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; clip: true;
@@ -943,10 +964,13 @@ export component DialogWindow inherits Window {
     in-out property <string> toast-text;
     in-out property <int> toast-age: 3000;
     callback dialog-edited();
+    callback focus-dialog();
+    focus-dialog => { dialog-keys.focus(); }
     callback action(string);
     callback profile-selected(int);
     callback scope-choice(int, int, bool);
     callback remove-scope(int);
+    callback move-scope(int, int);
     callback filter-group();
     callback rename-sql(int, string);
     callback notify(string);
@@ -1062,6 +1086,8 @@ export component DialogWindow inherits Window {
                         private property <int> scope-index: root.scope-page * 10 + row;
                         height: 28px; padding: 0px; spacing: Theme.control-gap;
                         Text { horizontal-stretch: 1; min-width: 0px; text: root.browser-scopes[parent.scope-index].profile + " / " + root.browser-scopes[parent.scope-index].database + " / " + root.browser-scopes[parent.scope-index].schema; color: Theme.text; vertical-alignment: center; overflow: elide; }
+                        CompactButton { width: 24px; text: "↑"; accessible-label: I18n.t("上移", "Move up"); enabled: !root.busy && parent.scope-index > 0; clicked => { root.move-scope(parent.scope-index, parent.scope-index - 1); } }
+                        CompactButton { width: 24px; text: "↓"; accessible-label: I18n.t("下移", "Move down"); enabled: !root.busy && parent.scope-index + 1 < root.browser-scopes.length; clicked => { root.move-scope(parent.scope-index, parent.scope-index + 1); } }
                         CompactButton { width: 64px; text: I18n.t("删除", "Remove"); destructive: true; enabled: !root.busy; clicked => { root.remove-scope(parent.scope-index); } }
                     }
                 }
@@ -1088,7 +1114,8 @@ export component DialogWindow inherits Window {
             }
     if root.dialog-mode == 4: VerticalBox {
                 padding: 16px; spacing: 12px;
-                LineEdit { height: 32px; text <=> root.rename-sql-text; accepted => { root.rename-sql(root.rename-sql-index, root.rename-sql-text); } edited => { root.dialog-edited(); } }
+                rename-input := LineEdit { height: 32px; text <=> root.rename-sql-text; accepted => { root.rename-sql(root.rename-sql-index, root.rename-sql-text); } edited => { root.dialog-edited(); } }
+                Timer { interval: 1ms; running: true; triggered => { self.running = false; rename-input.focus(); rename-input.select-all(); } }
                 HorizontalBox { height: 24px; padding: 0px; spacing: Theme.control-gap; alignment: end;
                     CompactButton { text: I18n.t("取消", "Cancel"); clicked => { root.rename-sql-open = false; root.dialog-edited(); } }
                     CompactButton { text: I18n.t("保存", "Save"); enabled: root.rename-sql-text != ""; clicked => { root.rename-sql(root.rename-sql-index, root.rename-sql-text); } }
@@ -1137,5 +1164,22 @@ export component DialogWindow inherits Window {
         animate opacity { duration: 50ms; }
         accessible-role: text; accessible-label: root.toast-text;
         toast-label := Text { x: 16px; width: parent.width - 32px; height: parent.height; text: root.toast-text; color: white; font-size: 12px; vertical-alignment: center; overflow: elide; }
+    }
+}
+
+export component ResultNotification inherits Window {
+    title: "MyQuery SQL";
+    no-frame: true;
+    always-on-top: true;
+    width: 380px; height: 88px;
+    background: transparent;
+    in property <string> message;
+    private property <int> age;
+    Timer { interval: 50ms; running: root.age < 5000; triggered => { root.age += 50; } }
+    Rectangle {
+        width: 100%; height: 100%;
+        background: Theme.panel; border-radius: Theme.control-radius; border-width: 1px; border-color: Theme.border;
+        opacity: max(0, 1 - root.age / 5000);
+        Text { x: 16px; y: 12px; width: parent.width - 32px; height: parent.height - 24px; text: root.message; color: Theme.text; font-family: "Microsoft YaHei UI"; font-size: 12px; wrap: word-wrap; vertical-alignment: center; }
     }
 }

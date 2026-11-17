@@ -18,6 +18,52 @@ pub(crate) fn native_window(title: &str) -> HWND {
     search.found
 }
 
+pub(crate) fn notify_result(ui: &AppWindow, message: &str) -> Option<crate::ResultNotification> {
+    use windows_sys::Win32::Graphics::Gdi::{MonitorFromWindow, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    unsafe {
+        use windows_sys::Win32::{System::Threading::GetCurrentProcessId, UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId}};
+        let mut process = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
+        if process == GetCurrentProcessId() { return None; }
+    }
+    let bubble = crate::ResultNotification::new().ok()?;
+    bubble.global::<Theme>().set_dark(ui.global::<Theme>().get_dark());
+    bubble.set_message(message.into());
+    let owner = native_window(&ui.get_window_title());
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    let monitor = unsafe { MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST) };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 { return None; }
+    bubble.show().ok()?;
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW};
+        let window = native_window("MyQuery SQL");
+        if !window.is_null() { SetWindowLongPtrW(window, GWL_EXSTYLE, GetWindowLongPtrW(window, GWL_EXSTYLE) | WS_EX_NOACTIVATE as isize | WS_EX_TOOLWINDOW as isize); }
+    }
+    let size = bubble.window().size();
+    let scale = ui.window().scale_factor();
+    let margin = (16.0 * scale).ceil() as i32;
+    let x = info.rcWork.right - size.width as i32 - margin;
+    let mut y = info.rcWork.bottom - size.height as i32 - margin;
+    unsafe {
+        use windows_sys::Win32::{Foundation::{POINT, RECT}, Graphics::Gdi::ClientToScreen, UI::WindowsAndMessaging::{GetClientRect, IsIconic}};
+        let mut client: RECT = std::mem::zeroed();
+        if IsIconic(owner) == 0 && GetClientRect(owner, &mut client) != 0 {
+            let mut bottom = POINT { x: 0, y: client.bottom };
+            if ClientToScreen(owner, &mut bottom) != 0 {
+                let status_top = bottom.y - (40.0 * scale).ceil() as i32;
+                if x < bottom.x + client.right && x + size.width as i32 > bottom.x && y < bottom.y && y + size.height as i32 > status_top {
+                    y = status_top - size.height as i32 - margin;
+                }
+            }
+        }
+    }
+    bubble.window().set_position(slint::PhysicalPosition::new(x, y.max(info.rcWork.top + margin)));
+    let weak = bubble.as_weak();
+    slint::Timer::single_shot(Duration::from_secs(5), move || { if let Some(bubble) = weak.upgrade() { let _ = bubble.hide(); } });
+    Some(bubble)
+}
+
 fn selected(ui: &AppWindow) -> i32 {
     if ui.get_save_prompt_open() { 5 }
     else if ui.get_rename_sql_open() { 4 }
@@ -162,6 +208,14 @@ pub fn bind(ui: &AppWindow) -> slint::Timer {
             let parent = ui.as_weak();
             dialog.on_remove_scope(move |index| { if let Some(ui) = parent.upgrade() { ui.invoke_remove_scope(index); } });
             let parent = ui.as_weak();
+            let child = dialog.as_weak();
+            dialog.on_move_scope(move |from, to| {
+                if let (Some(ui), Some(dialog)) = (parent.upgrade(), child.upgrade()) {
+                    edits_to_main(&dialog, &ui);
+                    ui.invoke_move_scope(from, to);
+                }
+            });
+            let parent = ui.as_weak();
             dialog.on_filter_group(move || { if let Some(ui) = parent.upgrade() { ui.invoke_filter_group(); } });
             let parent = ui.as_weak();
             dialog.on_rename_sql(move |index, title| { if let Some(ui) = parent.upgrade() { ui.invoke_rename_sql(index, title); } });
@@ -174,14 +228,40 @@ pub fn bind(ui: &AppWindow) -> slint::Timer {
                 slint::CloseRequestResponse::KeepWindowShown
             });
             if let Err(error) = dialog.show() { close(&ui, mode); ui.set_failed(true); ui.set_status(error.to_string().into()); return; }
-            let origin = ui.window().position();
-            let parent_size = ui.window().size();
-            let size = dialog.window().size();
-            dialog.window().set_position(slint::PhysicalPosition::new(origin.x + (parent_size.width as i32 - size.width as i32) / 2, origin.y + (parent_size.height as i32 - size.height as i32) / 2));
-            let owner = native_window(&ui.get_window_title());
-            let child = native_window(&dialog.get_window_title());
-            if !owner.is_null() && !child.is_null() {
-                unsafe { SetWindowLongPtrW(child, GWLP_HWNDPARENT, owner as isize); EnableWindow(owner, 0); SetForegroundWindow(child); }
+            let parent = ui.as_weak();
+            let child = dialog.as_weak();
+            if let Err(error) = slint::spawn_local(async move {
+                use slint::winit_030::{WinitWindowAccessor, winit::raw_window_handle::{HasWindowHandle, RawWindowHandle}};
+                let (Some(ui), Some(dialog)) = (parent.upgrade(), child.upgrade()) else { return; };
+                let Ok(window) = dialog.window().winit_window().await else { return; };
+                if !dialog.window().is_visible() || selected(&ui) != mode { return; }
+                let origin = ui.window().position();
+                let parent_size = ui.window().size();
+                let size = dialog.window().size();
+                dialog.window().set_position(slint::PhysicalPosition::new(origin.x + (parent_size.width as i32 - size.width as i32) / 2, origin.y + (parent_size.height as i32 - size.height as i32) / 2));
+                let owner = native_window(&ui.get_window_title());
+                if let Ok(RawWindowHandle::Win32(handle)) = window.window_handle().map(|handle| handle.as_raw()) {
+                    let child = handle.hwnd.get() as HWND;
+                    if !owner.is_null() {
+                        unsafe {
+                            use windows_sys::Win32::UI::{Input::KeyboardAndMouse::{SetActiveWindow, SetFocus}, WindowsAndMessaging::BringWindowToTop};
+                            SetWindowLongPtrW(child, GWLP_HWNDPARENT, owner as isize);
+                            EnableWindow(owner, 0);
+                            BringWindowToTop(child);
+                            SetForegroundWindow(child);
+                            SetActiveWindow(child);
+                            SetFocus(child);
+                        }
+                    }
+                }
+                window.focus_window();
+                if mode != 4 { dialog.invoke_focus_dialog(); }
+            }) {
+                close(&ui, mode);
+                let _ = dialog.hide();
+                ui.set_failed(true);
+                ui.set_status(error.to_string().into());
+                return;
             }
             *active.borrow_mut() = Some(dialog);
         }
