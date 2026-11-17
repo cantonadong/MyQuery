@@ -16,6 +16,15 @@ struct Request {
     max_bytes: u64,
     #[serde(default)]
     typed: bool,
+    #[serde(default)]
+    cancel_file: Option<PathBuf>,
+}
+
+async fn cancelled(request: &Request) {
+    loop {
+        if request.cancel_file.as_ref().is_some_and(|path| path.exists()) { return; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn query(request: &Request) -> Result<Value, String> {
@@ -34,7 +43,10 @@ async fn query(request: &Request) -> Result<Value, String> {
         statement = bound;
     }
     let timeout = Duration::from_secs(request.timeout_seconds);
-    let session = tokio::time::timeout(timeout, db::connect(&request.profile, &request.password)).await.map_err(|_| "TIMEOUT")??;
+    let session = tokio::select! {
+        result = tokio::time::timeout(timeout, db::connect(&request.profile, &request.password)) => result.map_err(|_| "TIMEOUT")??,
+        _ = cancelled(request) => return Err("CANCELLED".into()),
+    };
     let work = async {
         session.client.batch_execute(&format!("BEGIN READ ONLY; SET statement_timeout = {}", request.timeout_seconds.saturating_mul(1000))).await.map_err(db::error)?;
         let description = if request.typed {
@@ -53,24 +65,23 @@ async fn query(request: &Request) -> Result<Value, String> {
         result.write_json_rows(&request.output)?;
         Ok(json!({"headers": result.headers, "oids": oids, "row_count": result.count}))
     };
-    match tokio::time::timeout(timeout, work).await {
-        Ok(result) => result,
-        Err(_) => {
-            let cancel = session.client.cancel_token();
-            if request.profile.tls {
-                if let Ok(tls) = db::tls_connector(&request.profile) {
-                    let _ = tokio::time::timeout(Duration::from_secs(5), cancel.cancel_query(postgres_native_tls::MakeTlsConnector::new(tls))).await;
-                }
-            } else {
-                let _ = tokio::time::timeout(Duration::from_secs(5), cancel.cancel_query(tokio_postgres::NoTls)).await;
-            }
-            Err("TIMEOUT".into())
+    let reason = tokio::select! {
+        result = tokio::time::timeout(timeout, work) => match result { Ok(result) => return result, Err(_) => "TIMEOUT" },
+        _ = cancelled(request) => "CANCELLED",
+    };
+    let cancel = session.client.cancel_token();
+    if request.profile.tls {
+        if let Ok(tls) = db::tls_connector(&request.profile) {
+            let _ = tokio::time::timeout(Duration::from_secs(5), cancel.cancel_query(postgres_native_tls::MakeTlsConnector::new(tls))).await;
         }
+    } else {
+        let _ = tokio::time::timeout(Duration::from_secs(5), cancel.cancel_query(tokio_postgres::NoTls)).await;
     }
+    Err(reason.into())
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn myquery_core_version() -> u32 { 1 }
+pub extern "C" fn myquery_core_version() -> u32 { 2 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn myquery_core_execute(input: *const c_char) -> *mut c_char {
