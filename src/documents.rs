@@ -10,6 +10,14 @@ struct Document {
     text: String,
     saved: String,
     name: Option<String>,
+    #[serde(default)]
+    scope: Option<crate::config::BrowserSelection>,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(skip)]
+    loading: bool,
+    #[serde(skip)]
+    highlight: Option<(String, f32, ModelRc<ModelRc<crate::SqlRun>>)>,
     #[serde(skip)]
     running: bool,
     #[serde(skip)]
@@ -91,7 +99,7 @@ impl Document {
         ui.set_history_index(self.history_index.map_or(-1, |index| index as i32));
     }
     fn dirty(&self) -> bool {
-        self.text != self.saved
+        !self.read_only && self.text != self.saved
     }
 }
 #[derive(Deserialize, Serialize)]
@@ -149,11 +157,16 @@ impl Documents {
         ui.set_active_sql(self.active as i32);
         ui.set_active_document(self.tabs[self.active].id);
         ui.set_document_title(self.tabs[self.active].title().into());
+        ui.set_document_read_only(self.tabs[self.active].read_only);
+        ui.set_definition_loading(self.tabs[self.active].loading);
     }
     fn capture(&mut self, ui: &AppWindow) {
         if let Some(doc) = self.tabs.get_mut(self.active) {
             let dirty = doc.dirty();
-            doc.text = ui.get_sql().to_string();
+            if !doc.read_only { doc.text = ui.get_sql().to_string(); }
+            if ui.get_highlighted_sql() == doc.text.as_str() {
+                doc.highlight = Some((doc.text.clone(), ui.window().scale_factor(), ui.get_sql_lines()));
+            }
             doc.results = Some(ResultView::capture(ui));
             if doc.dirty() != dirty {
                 self.sync(ui);
@@ -164,10 +177,22 @@ impl Documents {
         if index >= self.tabs.len() {
             return;
         }
+        let changed = ui.get_active_document() != self.tabs[index].id;
         self.active = index;
         self.tabs[index].show_results(ui);
+        if let Some((_, _, lines)) = self.tabs[index].highlight.as_ref().filter(|(text, scale, _)| text == &self.tabs[index].text && *scale == ui.window().scale_factor()) {
+            ui.set_sql_lines(lines.clone());
+            ui.set_highlighted_sql(self.tabs[index].text.as_str().into());
+        }
         ui.set_sql(self.tabs[index].text.as_str().into());
         self.sync(ui);
+        if changed {
+            if let Some(scope) = &self.tabs[index].scope {
+                ui.invoke_restore_query_scope(scope.profile.as_str().into(), scope.database.as_str().into(), scope.schema.as_str().into());
+            } else if ui.get_switching() {
+                ui.invoke_restore_query_scope("".into(), "".into(), "".into());
+            }
+        }
     }
     fn can_add(&self, ui: &AppWindow) -> bool {
         if self.tabs.len() >= 32 {
@@ -207,6 +232,9 @@ impl Documents {
             path,
             saved: text.clone(),
             name: None,
+            scope: None,
+            read_only: false, loading: false,
+            highlight: None,
             running: false,
             results: None,
             notice: 0, history: Vec::new(), history_index: None, run_sql: None,
@@ -257,6 +285,7 @@ impl Documents {
         let Some(doc) = self.tabs.iter().find(|doc| doc.id == id) else {
             return;
         };
+        if doc.read_only { return; }
         ui.invoke_request_document_save(
             id,
             doc.path
@@ -283,6 +312,9 @@ pub fn bind(ui: &AppWindow) -> Rc<RefCell<Documents>> {
             text: ui.get_sql().to_string(),
             saved: String::new(),
             name: None,
+            scope: None,
+            read_only: false, loading: false,
+            highlight: None,
             running: false,
             results: None,
             notice: 0, history: Vec::new(), history_index: None, run_sql: None,
@@ -314,6 +346,24 @@ pub fn bind(ui: &AppWindow) -> Rc<RefCell<Documents>> {
         _ => {}
     }
     let active = state.borrow().active;
+    let docs = state.clone();
+    let weak = ui.as_weak();
+    ui.on_definition_loaded(move |id, text| {
+        let Some(ui) = weak.upgrade() else { return; };
+        let mut docs = docs.borrow_mut();
+        let Some(index) = docs.tabs.iter().position(|doc| doc.id == id) else { return; };
+        let doc = &mut docs.tabs[index];
+        doc.text = text.to_string();
+        doc.loading = false;
+        if docs.active == index { ui.set_sql(text); }
+        docs.sync(&ui);
+    });
+    let docs = state.clone();
+    ui.on_query_scope_succeeded(move |id, profile, database, schema| {
+        if let Some(doc) = docs.borrow_mut().tabs.iter_mut().find(|doc| doc.id == id) {
+            doc.scope = Some(crate::config::BrowserSelection { profile: profile.to_string(), database: database.to_string(), schema: schema.to_string() });
+        }
+    });
     state.borrow_mut().activate(ui, active);
     let docs = Rc::downgrade(&state);
     let weak = ui.as_weak();
@@ -564,6 +614,21 @@ pub fn bind(ui: &AppWindow) -> Rc<RefCell<Documents>> {
     state
 }
 
+pub fn open_definition(ui: &AppWindow, docs: &Rc<RefCell<Documents>>, title: String) -> Option<i32> {
+    let mut docs = docs.borrow_mut();
+    if !docs.can_add(ui) { return None; }
+    docs.capture(ui);
+    docs.add(ui, None, String::new());
+    let active = docs.active;
+    let doc = &mut docs.tabs[active];
+    doc.name = Some(title);
+    doc.read_only = true;
+    doc.loading = true;
+    let id = doc.id;
+    docs.sync(ui);
+    Some(id)
+}
+
 pub fn action(ui: &AppWindow, docs: &Rc<RefCell<Documents>>, action: &str) -> bool {
     if action == "import" {
         return !docs.borrow().can_add(ui);
@@ -614,6 +679,9 @@ mod tests {
             text: "SELECT 1;".into(),
             saved: "SELECT 1;".into(),
             name: None,
+            scope: None,
+            read_only: false, loading: false,
+            highlight: None,
             running: false,
             results: None,
             notice: 0, history: Vec::new(), history_index: None, run_sql: None,

@@ -4,7 +4,7 @@ import { Theme } from "theme.slint";
 
 export struct SearchMatch { start: int, end: int, count: int, ordinal: int }
 
-export struct SqlRun { text: string, color: color, source: string, offset: int, end: int }
+export struct SqlRun { text: string, color: color, source: string, line-source: string, offset: int, end: int, line-y: float }
 export struct SqlCompletion { text: string, offset: int }
 
 component FindButton inherits ActionButton {
@@ -16,12 +16,14 @@ component FindButton inherits ActionButton {
 export component SqlEditor inherits Rectangle {
     in-out property <string> text;
     in property <bool> read-only;
+    changed read-only => { root.suggestions = []; }
     in property <bool> zh;
     in property <[[SqlRun]]> lines;
     in property <string> highlighted-source;
     in property <int> completion-revision;
     changed completion-revision => { if input.has-focus { root.refresh-completion(); } }
     callback highlight(string);
+    callback line-measured(string, int, float);
     callback complete(string, int) -> [string];
     callback insert-completion(string, int, string) -> SqlCompletion;
     callback pair-quote(string, int, int, string) -> SqlCompletion;
@@ -69,19 +71,15 @@ export component SqlEditor inherits Rectangle {
     }
     function close-find() { root.find-open = false; input.focus(); }
     private property <bool> colored: root.text == root.highlighted-source && root.lines.length > 0 && input.preedit-text == "";
-    private property <length> line-height: metric.preferred-height / 2;
+    private property <length> line-height: input.preferred-height / max(1, root.lines.length);
     private property <Point> cursor;
     background: Theme.surface;
     border-width: 1px;
     border-color: input.has-focus ? Theme.focus : Theme.border;
     border-radius: Theme.control-radius;
     forward-focus: input;
-    changed text => { root.refresh-find(false); root.highlight(root.text); metric.set-selection-offsets(3, 3); }
-    init => { root.highlight(root.text); metric.set-selection-offsets(3, 3); }
-    metric := TextInput {
-        visible: false; text: "Mg\nMg"; single-line: false; wrap: no-wrap; font-family: "Consolas"; font-size: 13px;
-        cursor-position-changed(pos) => { if pos.y > 0px { root.line-height = pos.y; } }
-    }
+    changed text => { root.refresh-find(false); root.highlight(root.text); }
+    init => { root.highlight(root.text); }
     PopupMenu {
         x: 5px; y: 5px; width: parent.width - 10px; height: parent.height - self.y - 5px;
         actions: [
@@ -95,30 +93,52 @@ export component SqlEditor inherits Rectangle {
             content-width: max(self.visible-width, input.preferred-width + 4px);
             content-height: max(self.visible-height, input.preferred-height);
             for line[index] in root.lines: Rectangle {
-                x: 0px; y: index * root.line-height;
-                width: scroll.content-width; height: root.line-height;
-                clip: true;
-                if root.colored && index * root.line-height + scroll.content-y >= -root.line-height && index * root.line-height + scroll.content-y <= scroll.visible-height: Rectangle {
-                width: parent.width; height: parent.height;
+                z: 1;
+                x: input.x; y: input.y;
+                width: input.width; height: input.height;
+                if root.colored && index * root.line-height + scroll.content-y >= -scroll.visible-height && index * root.line-height + scroll.content-y <= 2 * scroll.visible-height: Rectangle {
+                private property <Point> line-position;
+                width: parent.width; height: 2 * root.line-height;
+                y: line.length > 0 && line[0].line-y >= 0 ? line[0].line-y * 1px : self.line-position.y;
+                if line.length > 0 && line[0].line-y < 0: line-metric := TextInput {
+                    visible: false;
+                    width: input.width; height: input.height;
+                    text: root.text; single-line: false; wrap: no-wrap; vertical-alignment: top;
+                    font-family: "Consolas"; font-size: 13px;
+                    private property <int> offset: line.length > 0 ? line[0].offset : 0;
+                    init => { self.set-selection-offsets(self.offset, self.offset); }
+                    changed text => { self.set-selection-offsets(self.offset, self.offset); }
+                    changed offset => { self.set-selection-offsets(self.offset, self.offset); }
+                    changed width => { self.set-selection-offsets(self.offset, self.offset); }
+                    changed height => { self.set-selection-offsets(self.offset, self.offset); }
+                    cursor-position-changed(pos) => { parent.line-position = pos; if self.width > 0px && self.height > 0px { root.line-measured(root.text, index, pos.y / 1px); } }
+                }
                 for run in line: TextInput {
-                    width: parent.width; height: parent.height;
-                    text: run.source; color: transparent;
+                    private property <length> cursor-y;
+                    x: 0px; y: -self.cursor-y;
+                    width: input.width; height: 2 * root.line-height;
+                    text: run.line-source; color: transparent;
                     selection-background-color: transparent;
                     selection-foreground-color: Theme.syntax-color(run.color);
                     read-only: true; enabled: false;
                     single-line: false; wrap: no-wrap; vertical-alignment: top;
                     font-family: "Consolas"; font-size: 13px;
-                    private property <int> start: run.offset;
-                    private property <int> end: run.end;
-                    init => { self.set-selection-offsets(self.start, self.end); }
-                    changed text => { self.set-selection-offsets(self.start, self.end); }
-                    changed start => { self.set-selection-offsets(self.start, self.end); }
-                    changed end => { self.set-selection-offsets(self.start, self.end); }
+                    private property <int> start: run.offset - line[0].offset;
+                    private property <int> end: run.end - line[0].offset;
+                    init => { self.set-selection-offsets(self.end, self.start); }
+                    changed text => { self.set-selection-offsets(self.end, self.start); }
+                    changed start => { self.set-selection-offsets(self.end, self.start); }
+                    changed end => { self.set-selection-offsets(self.end, self.start); }
+                    changed width => { self.set-selection-offsets(self.end, self.start); }
+                    changed height => { self.set-selection-offsets(self.end, self.start); }
+                    cursor-position-changed(pos) => { self.cursor-y = pos.y; }
                 }
                 }
             }
             input := TextInput {
                 x: 0px; y: 0px;
+                width: scroll.content-width; height: scroll.content-height;
+                vertical-alignment: top;
                 text <=> root.text;
                 single-line: false;
                 read-only: root.read-only;
@@ -127,7 +147,7 @@ export component SqlEditor inherits Rectangle {
                 font-size: 13px;
                 color: root.colored ? transparent : Theme.text;
                 selection-background-color: root.find-open && root.found.start >= 0 ? Theme.search-match : Theme.editor-selection;
-                selection-foreground-color: root.find-open && root.found.start >= 0 ? Theme.search-match-text : Theme.text;
+                selection-foreground-color: root.colored ? transparent : root.find-open && root.found.start >= 0 ? Theme.search-match-text : Theme.text;
                 page-height: scroll.visible-height;
                 edited => { input.focus(); root.highlight(root.text); root.completion-pending = true; }
                 key-pressed(event) => {
@@ -164,7 +184,7 @@ export component SqlEditor inherits Rectangle {
                     if pos.y + scroll.content-y > scroll.visible-height - root.line-height { scroll.content-y = min(0px, scroll.visible-height - pos.y - root.line-height); }
                 }
             }
-            Rectangle { x: root.cursor.x; y: root.cursor.y; width: 1px; height: root.line-height; background: Theme.text; visible: root.colored && input.has-focus && !root.read-only && input.cursor-position-byte-offset == input.anchor-position-byte-offset; }
+            Rectangle { z: 2; x: root.cursor.x; y: root.cursor.y; width: 1px; height: root.line-height; background: Theme.text; visible: root.colored && input.has-focus && !root.read-only && input.cursor-position-byte-offset == input.anchor-position-byte-offset; }
         }
     }
     if root.suggestions.length > 0 && input.has-focus: Rectangle {

@@ -110,13 +110,16 @@ export component AppWindow inherits Window {
     // A connection/database/schema change is running in the background; the SQL area stays usable.
     in-out property <bool> switching;
     private property <bool> browser-busy: root.busy || root.switching;
-    // Index 0 of the connection, database and schema selectors is "All".
-    private property <bool> browse-all: root.physical-index == 0 || root.database-index == 0 || root.schema-index == 0;
+    // Index 0 of the database and schema selectors is "All".
+    private property <bool> browse-all: root.database-index == 0 || root.schema-index == 0;
     in-out property <int> browser-refresh;
     in-out property <bool> queries-running;
     in-out property <bool> document-saving;
     in-out property <int> active-document;
     in-out property <string> document-title;
+    in-out property <bool> document-read-only;
+    in-out property <bool> definition-loading;
+    callback definition-loaded(int, string);
     in-out property <bool> rename-sql-open;
     in-out property <int> rename-sql-index;
     in-out property <string> rename-sql-text;
@@ -130,6 +133,7 @@ export component AppWindow inherits Window {
     in-out property <[string]> column-index;
     in-out property <int> completion-revision;
     in-out property <string> connection-label;
+    private property <bool> connection-selected: root.connection-label != "";
     in-out property <[string]> profiles;
     in-out property <[string]> visible-profiles;
     in-out property <[BrowserScope]> browser-scopes;
@@ -186,6 +190,7 @@ export component AppWindow inherits Window {
     in-out property <[[SqlRun]]> sql-lines;
     in-out property <string> highlighted-sql;
     callback highlight(string);
+    callback sql-line-measured(string, int, float);
     callback complete-sql(string, int) -> [string];
     callback insert-completion(string, int, string) -> SqlCompletion;
     callback pair-quote(string, int, int, string) -> SqlCompletion;
@@ -225,6 +230,8 @@ export component AppWindow inherits Window {
     in-out property <int> history-index: -1;
     in-out property <int> history-count;
     callback run-submitted(string);
+    callback query-scope-succeeded(int, string, string, string);
+    callback restore-query-scope(string, string, string);
     callback history-selected(int, int);
     callback run-not-executed(int);
     callback acknowledge-query();
@@ -374,20 +381,20 @@ export component AppWindow inherits Window {
                 height: !root.field-panel-hidden && (root.field-details.length > 0 || root.fields-loading) ? max(310px, (sidebar-layout.height - 13px) * (1 - root.field-ratio)) : sidebar-layout.height - 8px;
                 HorizontalBox { spacing: Theme.control-gap; padding: 0px;
                 Caption { width: I18n.zh ? 42px : 78px; text: I18n.t("连接", "Connection"); }
-                SelectBox { height: 24px; model: root.visible-profiles; current-index <=> root.physical-index; enabled: !root.browser-busy; selected(value) => { root.physical-selected(self.current-index); } }
+                SelectBox { height: 24px; dim-disabled: false; model: root.visible-profiles; current-index <=> root.physical-index; enabled: !root.browser-busy; selected(value) => { root.physical-selected(self.current-index); } }
                 }
                 HorizontalBox { spacing: Theme.control-gap; padding: 0px;
                 Caption { width: I18n.zh ? 42px : 78px; text: I18n.t("库名", "Database"); }
-                SelectBox { height: 24px; model: root.databases; current-index <=> root.database-index; enabled: root.connected && root.physical-index > 0 && !root.browser-busy; selected(value) => { root.database-selected(self.current-index, value); } }
+                SelectBox { height: 24px; dim-disabled: false; model: root.databases; current-index <=> root.database-index; enabled: root.connection-selected && root.physical-index >= 0 && !root.browser-busy; selected(value) => { root.database-selected(self.current-index, value); } }
                 }
                 HorizontalBox { spacing: Theme.control-gap; padding: 0px;
                 Caption { width: I18n.zh ? 42px : 78px; text: I18n.t("模式", "Schema"); }
-                SelectBox { height: 24px; model: root.schemas; current-index <=> root.schema-index; enabled: root.connected && root.physical-index > 0 && root.database-index > 0 && !root.browser-busy; selected(value) => { root.schema = self.current-index > 0 ? value : ""; root.schema-selected(self.current-index, value); } }
+                SelectBox { height: 24px; dim-disabled: false; model: root.schemas; current-index <=> root.schema-index; enabled: root.connection-selected && root.physical-index >= 0 && root.database-index > 0 && !root.browser-busy; selected(value) => { root.schema = self.current-index > 0 ? value : ""; root.schema-selected(self.current-index, value); } }
                 }
                 HorizontalBox { spacing: Theme.control-gap; padding: 0px;
                     Caption { width: I18n.zh ? 42px : 78px; text: I18n.t("过滤", "Filter"); }
-                    SelectBox { height: 24px; model: root.prefix-options; current-index <=> root.prefix-index; enabled: root.connected && !root.browser-busy; selected(value) => { root.prefix-selected(self.current-index); } }
-                    IconButton { width: 24px; height: 24px; icon: @image-url("icons/close.svg"); accessible-label: I18n.t("删除", "Remove"); destructive: true; enabled: root.connected && root.prefix-index > 0 && root.prefix-index <= root.table-prefixes.length && !root.browser-busy; clicked => { root.action("remove-prefix"); } Tooltip { text: @markdown("\{I18n.t("删除", "Remove")}"); } }
+                    SelectBox { height: 24px; dim-disabled: false; model: root.prefix-options; current-index <=> root.prefix-index; enabled: root.connection-selected && !root.browser-busy; selected(value) => { root.prefix-selected(self.current-index); } }
+                    IconButton { width: 24px; height: 24px; icon: @image-url("icons/close.svg"); accessible-label: I18n.t("删除", "Remove"); destructive: true; enabled: root.connection-selected && root.prefix-index > 0 && root.prefix-index <= root.table-prefixes.length && !root.browser-busy; clicked => { root.action("remove-prefix"); } Tooltip { text: @markdown("\{I18n.t("删除", "Remove")}"); } }
                 }
                 HorizontalBox { padding: 0px;
                     spacing: Theme.control-gap;
@@ -397,7 +404,7 @@ export component AppWindow inherits Window {
                     IconButton {
                         width: 24px; height: 24px; icon: @image-url("icons/refresh.svg");
                         accessible-label: I18n.t("刷新全部", "Refresh all");
-                        enabled: root.connected && root.schema != "" && !root.browser-busy;
+                        enabled: root.connection-selected && root.schema != "" && !root.browser-busy;
                         clicked => { root.action("refresh-schema"); }
                         Tooltip { text: @markdown("\{I18n.t("刷新全部", "Refresh all")} · \{I18n.t("刷新表和字段", "Refresh tables and columns")}"); }
                     }
@@ -422,7 +429,7 @@ export component AppWindow inherits Window {
                             clicked => { root.object-search = ""; root.filter-objects(); object-search-input.focus(); }
                         }
                     }
-                    IconButton { width: 24px; height: 24px; icon: @image-url("icons/add.svg"); accessible-label: I18n.t("添加", "Add"); enabled: root.connected && root.object-search != "" && !root.browser-busy; clicked => { root.action("add-prefix"); } Tooltip { text: @markdown("\{I18n.t("添加", "Add")}"); } }
+                    IconButton { width: 24px; height: 24px; icon: @image-url("icons/add.svg"); accessible-label: I18n.t("添加", "Add"); enabled: root.connection-selected && root.object-search != "" && !root.browser-busy; clicked => { root.action("add-prefix"); } Tooltip { text: @markdown("\{I18n.t("添加", "Add")}"); } }
                 }
                 object-menu := PopupMenu {
                     vertical-stretch: 1;
@@ -435,9 +442,10 @@ export component AppWindow inherits Window {
                         { text: root.show-hidden ? I18n.t("恢复显示", "Restore visibility") : I18n.t("隐藏", "Hide"), enabled: !root.browser-busy && !root.browse-all && root.table-index >= 0, checked: false, icon: @image-url("icons/visibility.svg") },
                         { text: I18n.t("快速 LIMIT 10", "Quick LIMIT 10"), enabled: !root.show-hidden && !root.browser-busy && root.table-index >= 0, checked: false, icon: @image-url("icons/limit.svg") },
                         { text: I18n.t("快速 GROUP BY…", "Quick GROUP BY…"), enabled: !root.show-hidden && !root.browser-busy && root.table-index >= 0, checked: false, icon: @image-url("icons/group.svg") },
+                        { text: I18n.t("查看定义", "View definition"), enabled: !root.browser-busy && !root.document-saving && !root.save-prompt-open && root.table-index >= 0, checked: false, icon: @image-url("icons/table-structure.svg") },
                         { text: I18n.t("全选", "Select all"), enabled: root.tables.length > 0, checked: false, icon: @image-url("icons/copy.svg") }
                     ];
-                    activated(choice) => { if choice == 0 { root.browser-copy(false); } else if choice == 1 { root.action("copy-structure"); } else if choice == 2 { root.action(root.show-hidden ? "restore-object" : "hide-object"); } else if choice == 3 { root.action("quick-limit"); } else if choice == 4 { root.action("quick-group"); } else if choice == 5 { root.browser-select(false, -1, false, false); } }
+                    activated(choice) => { if choice == 0 { root.browser-copy(false); } else if choice == 1 { root.action("copy-structure"); } else if choice == 2 { root.action(root.show-hidden ? "restore-object" : "hide-object"); } else if choice == 3 { root.action("quick-limit"); } else if choice == 4 { root.action("quick-group"); } else if choice == 5 { root.action("view-definition"); } else if choice == 6 { root.browser-select(false, -1, false, false); } }
                     DenseList {
                         text-padding: 2px;
                         visible: root.browser-refresh == 0;
@@ -687,19 +695,30 @@ export component AppWindow inherits Window {
                         width: 24px;
                         VerticalLayout {
                             spacing: Theme.control-gap; alignment: start;
-                            IconButton { height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/run.svg"); accessible-label: I18n.t("执行", "Run"); enabled: (root.connected || root.switching || root.physical-index == 0) && !root.busy && !root.query-running; clicked => { root.action("run"); } Tooltip { text: @markdown("\{I18n.t("执行", "Run")}"); } }
+                            IconButton { height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/run.svg"); accessible-label: I18n.t("执行", "Run"); enabled: !root.document-read-only && (root.connection-selected || root.switching) && !root.busy && !root.query-running; clicked => { root.action("run"); } Tooltip { text: @markdown("\{I18n.t("执行", "Run")}"); } }
                             IconButton { height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/cancel.svg"); accessible-label: I18n.t("取消", "Cancel"); enabled: root.busy || root.switching || root.query-running; clicked => { root.action("cancel"); } Tooltip { text: @markdown("\{I18n.t("取消", "Cancel")}"); } }
-                            IconButton { height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/save.svg"); accessible-label: I18n.t("保存", "Save"); enabled: !root.busy; clicked => { root.action("save-document"); } Tooltip { text: @markdown("\{I18n.t("保存", "Save")}"); } }
+                            IconButton { height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/save.svg"); accessible-label: I18n.t("保存", "Save"); enabled: !root.busy && !root.document-read-only; clicked => { root.action("save-document"); } Tooltip { text: @markdown("\{I18n.t("保存", "Save")}"); } }
                             IconButton { height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/search.svg"); accessible-label: I18n.t("查找", "Find") + " (Ctrl+F)"; clicked => { sql-editor.open-find(); } Tooltip { text: @markdown("\{I18n.t("查找", "Find")} (Ctrl+F)"); } }
                             IconButton { height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/import.svg"); accessible-label: I18n.t("导入", "Import"); enabled: !root.busy; clicked => { root.action("import"); } Tooltip { text: @markdown("\{I18n.t("导入", "Import")}"); } }
                             IconButton { height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/export.svg"); accessible-label: I18n.t("导出", "Export"); enabled: !root.busy; clicked => { root.action("save-sql"); } Tooltip { text: @markdown("\{I18n.t("导出", "Export")}"); } }
                             IconButton { height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/copy.svg"); accessible-label: I18n.t("复制全部 SQL", "Copy all SQL"); enabled: root.sql != ""; clicked => { root.copy-text(root.sql, false); } Tooltip { text: @markdown("\{I18n.t("复制全部 SQL", "Copy all SQL")}"); } }
                         }
                     }
-                    editor-pane := VerticalLayout {
+                    editor-pane := Rectangle {
                         horizontal-stretch: 1;
                         min-height: 0px;
-                        sql-editor := SqlEditor { indent-newline(code, anchor, cursor) => { return root.indent-newline(code, anchor, cursor); } pair-quote(code, anchor, cursor, quote) => { return root.pair-quote(code, anchor, cursor, quote); } completion-revision: root.completion-revision; insert-completion(code, offset, value) => { return root.insert-completion(code, offset, value); } complete(code, offset) => { return root.complete-sql(code, offset); } save => { if !root.busy && !root.save-prompt-open { root.action("save-document"); } } find(needle, current, backward) => { return root.find-sql(needle, current, backward); } text <=> root.sql; read-only: root.query-running || root.save-prompt-open; zh: I18n.zh; lines: root.sql-lines; highlighted-source: root.highlighted-sql; highlight(code) => { root.highlight(code); } }
+                        if root.definition-loading: Rectangle {
+                            z: 1; width: parent.width; height: parent.height;
+                            background: Theme.surface; border-width: 1px; border-color: Theme.border; border-radius: Theme.control-radius;
+                            TouchArea { }
+                            HorizontalLayout {
+                                x: 0px; y: (parent.height - 24px) / 2; width: 100%; height: 24px;
+                                spacing: Theme.control-gap; alignment: center;
+                                LoadingIndicator { }
+                                Caption { text: I18n.t("正在加载定义…", "Loading definition…"); }
+                            }
+                        }
+                        sql-editor := SqlEditor { line-measured(code, index, y) => { root.sql-line-measured(code, index, y); } width: parent.width; height: parent.height; indent-newline(code, anchor, cursor) => { return root.indent-newline(code, anchor, cursor); } pair-quote(code, anchor, cursor, quote) => { return root.pair-quote(code, anchor, cursor, quote); } completion-revision: root.completion-revision; insert-completion(code, offset, value) => { return root.insert-completion(code, offset, value); } complete(code, offset) => { return root.complete-sql(code, offset); } save => { if !root.busy && !root.save-prompt-open { root.action("save-document"); } } find(needle, current, backward) => { return root.find-sql(needle, current, backward); } text <=> root.sql; read-only: root.document-read-only || root.query-running || root.save-prompt-open; zh: I18n.zh; lines: root.sql-lines; highlighted-source: root.highlighted-sql; highlight(code) => { root.highlight(code); } }
                     }
                 }
                     }

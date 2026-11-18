@@ -104,7 +104,6 @@ pub fn highlight(sql: &str) -> Vec<Vec<crate::SqlRun>> {
     if sql.len() > 2 * 1024 * 1024 {
         return Vec::new();
     }
-    let sql = sql.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines = vec![Vec::new()];
     for (range, color) in tokens(&sql) {
         for (index, part) in sql[range].split('\n').enumerate() {
@@ -118,14 +117,24 @@ pub fn highlight(sql: &str) -> Vec<Vec<crate::SqlRun>> {
                     offset,
                     end: offset + part.len() as i32,
                     source: Default::default(),
+                    line_source: Default::default(),
+                    line_y: -1.0,
                 });
             }
         }
     }
+    let source = slint::SharedString::from(sql);
+    let mut line_start = 0;
     for line in &mut lines {
-        let source: String = line.iter().map(|run| run.text.as_str()).collect();
-        let source = slint::SharedString::from(source);
-        for run in line { run.source = source.clone(); }
+        let line_source = slint::SharedString::from(line.iter().map(|run| run.text.as_str()).collect::<String>());
+        let line_bytes: i32 = line.iter().map(|run| run.text.len() as i32).sum();
+        for run in line {
+            run.source = source.clone();
+            run.line_source = line_source.clone();
+            run.offset += line_start;
+            run.end += line_start;
+        }
+        line_start += line_bytes + 1;
     }
     lines
 }
@@ -187,16 +196,17 @@ mod tests {
     }
 
     #[test]
-    fn highlighted_runs_use_offsets_in_the_complete_line() {
-        for line in highlight("SELECT '中文', 42 AS value\nGROUP BY 1, 2") {
-            let text: String = line.iter().map(|run| run.text.as_str()).collect();
-            let mut offset = 0;
+    fn highlighted_runs_use_offsets_in_the_complete_document() {
+        let text = "SELECT '中文', 42 AS value\nGROUP BY 1, 2";
+        let mut offset = 0;
+        for line in highlight(text) {
             for run in line {
                 assert_eq!(run.source.as_str(), text);
                 assert_eq!(run.offset as usize, offset);
                 assert!(text[offset..].starts_with(run.text.as_str()));
                 offset += run.text.len();
             }
+            offset += 1;
         }
     }
 }

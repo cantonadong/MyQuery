@@ -4,7 +4,6 @@ mod cache;
 mod completion;
 mod documents;
 mod dialogs;
-mod route;
 mod syntax;
 
 use myquery_core::{config, db, results};
@@ -140,6 +139,7 @@ fn show_profile(ui: &AppWindow, profile: Profile, password: String) {
 
 fn filter_objects(ui: &AppWindow) {
     use slint::Model;
+    if ui.get_switching() { return; }
     let search = ui.get_object_search().to_lowercase();
     let prefix = ui.get_active_prefix().to_lowercase();
     let show_hidden = ui.get_show_hidden();
@@ -151,7 +151,7 @@ fn filter_objects(ui: &AppWindow) {
     for object in objects.iter() {
         let kind = object.kind as usize;
         let name = object.name.to_lowercase();
-        // In "All" views names are qualified (conn.schema.table); prefixes apply to the object name.
+        // In "All" views names are qualified; prefixes apply to the object name.
         let base = name.rsplit('.').next().unwrap_or(name.as_str());
         if kind < 3 && (name.contains(&search) || columns.iter().any(|(table, fields)| table == object.name.as_str() && fields.iter().any(|field| field.to_lowercase().contains(&search)))) && (show_hidden || base.starts_with(&prefix))
             && (show_hidden || !hidden.contains(&(object.name.clone(), object.kind))) {
@@ -194,7 +194,7 @@ fn filter_group(ui: &AppWindow) {
 /// Relabels the leading "All" entry of the connection, database and schema selectors.
 fn localize_all(ui: &AppWindow) {
     let label: SharedString = tr(ui.global::<I18n>().get_zh(), "全部", "All").into();
-    for model in [ui.get_visible_profiles(), ui.get_databases(), ui.get_schemas()] {
+    for model in [ui.get_databases(), ui.get_schemas()] {
         if model.row_count() > 0 { model.set_row_data(0, label.clone()); }
     }
 }
@@ -211,9 +211,11 @@ fn prefix_options(ui: &AppWindow) {
 }
 
 enum Command {
+    Definition(i32, String, String, i32),
+    RestoreScope(String, String, String),
     Connect(Profile, String),
     SwitchDatabase(String),
-    /// Browse every connection (0), every database of the connection (1) or every schema (2).
+    /// Browse every database of the selected connection (1) or every schema (2).
     BrowseAll(i32),
     Disconnect,
     SaveProfile(Profile, String, Option<usize>),
@@ -269,8 +271,8 @@ struct Worker {
     current_schema: String,
     metadata_cache: cache::MetadataCache,
     query_only: bool,
-    /// Sessions opened for statements routed to other connections (`conn.table`).
-    routes: Vec<(Profile, db::Session)>,
+    /// Browser sessions retained for switching connections.
+    idle_sessions: Vec<(Profile, db::Session)>,
     browse: Browse,
     /// "All" view entries: display name → (profile with database, schema, object).
     all_index: std::collections::HashMap<String, (Profile, String, String)>,
@@ -278,12 +280,11 @@ struct Worker {
 
 #[derive(Clone, Copy, Default, PartialEq)]
 struct Browse {
-    connections: bool,
     databases: bool,
     schemas: bool,
 }
 impl Browse {
-    fn any(self) -> bool { self.connections || self.databases || self.schemas }
+    fn any(self) -> bool { self.databases || self.schemas }
 }
 
 /// Sessions a SQL tab keeps between runs.
@@ -291,7 +292,6 @@ impl Browse {
 struct TabSessions {
     session: Option<db::Session>,
     profile: Option<Profile>,
-    routes: Vec<(Profile, db::Session)>,
 }
 
 /// UI bookkeeping that runs after a worker command finishes.
@@ -341,7 +341,7 @@ fn spawn_query(
         active: worker.active.clone(), sets: Vec::new(), tab_sets: std::collections::HashMap::new(),
         result_tab: request.document_id, cancelled, zh: request.zh, settings_error: worker.settings_error.clone(),
         current_schema: worker.current_schema.clone(), metadata_cache: cache::MetadataCache::default(), query_only: true,
-        routes: saved.routes, browse: worker.browse, all_index: std::collections::HashMap::new(),
+        idle_sessions: Vec::new(), browse: worker.browse, all_index: std::collections::HashMap::new(),
     };
     queries.spawn(async move {
         let result = query.handle(request.command).await;
@@ -359,7 +359,7 @@ fn finish_request(worker: &mut Worker, prefetches: &mut tokio::task::JoinSet<Res
                 result_tab: -1, cancelled: Arc::new(AtomicBool::new(false)), zh: worker.zh,
                 settings_error: None, current_schema: String::new(),
                 metadata_cache: cache::MetadataCache::load(), query_only: true,
-                routes: Vec::new(), browse: Browse::default(), all_index: std::collections::HashMap::new(),
+                idle_sessions: Vec::new(), browse: Browse::default(), all_index: std::collections::HashMap::new(),
             };
             prefetches.spawn_blocking(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| error.to_string())?;
@@ -371,7 +371,7 @@ fn finish_request(worker: &mut Worker, prefetches: &mut tokio::task::JoinSet<Res
     let zh = worker.zh;
     let Finish { selected_fields, fields_request, browser_refresh, notify_success, switch, keep_connection, .. } = finish;
     update(&worker.ui, move |ui| {
-        if switch { ui.set_switching(false); }
+        if switch { ui.set_switching(false); filter_objects(&ui); }
         else if selected_fields.is_none() { ui.set_busy(false); }
         if browser_refresh { ui.set_browser_refresh(0); }
         if fields_request && selected_fields.as_ref().is_none_or(|(schema, table)| ui.get_schema() == schema.as_str() && ui.get_fields_loading_name() == table.as_str()) { ui.set_fields_loading(false); }
@@ -395,7 +395,7 @@ fn finish_request(worker: &mut Worker, prefetches: &mut tokio::task::JoinSet<Res
 
 /// Connection and browser changes run in the background so the SQL area and results stay usable.
 fn is_switch(command: &Command) -> bool {
-    matches!(command, Command::Connect(..) | Command::UseProfile(..) | Command::SwitchDatabase(..) | Command::BrowseAll(..)
+    matches!(command, Command::RestoreScope(..) | Command::Connect(..) | Command::UseProfile(..) | Command::SwitchDatabase(..) | Command::BrowseAll(..)
         | Command::Tables(..) | Command::Refresh | Command::RefreshSchema | Command::Reconnect)
 }
 /// Commands that only touch SQL tabs or held results; allowed while a switch is running.
@@ -429,19 +429,15 @@ impl Worker {
             .collect();
         let visible = self.settings.visible_profiles();
         let physical_index = self.physical_index(&visible);
-        let zh = self.zh;
         update(&self.ui, move |ui| {
             ui.set_profiles(strings(profiles));
-            ui.set_visible_profiles(with_all(zh, visible));
+            ui.set_visible_profiles(strings(visible));
             ui.set_physical_index(physical_index);
         });
     }
-    /// Selector index of the connection; 0 is "All".
     fn physical_index(&self, visible: &[String]) -> i32 {
-        if self.browse.connections { return 0; }
-        self.active.as_ref().and_then(|(active, _)| visible.iter().position(|name| name == &active.name)).map_or(-1, |index| index as i32 + 1)
+        self.active.as_ref().and_then(|(active, _)| visible.iter().position(|name| name == &active.name)).map_or(-1, |index| index as i32)
     }
-    /// Database used for `conn.` statements and "All" views of a saved connection.
     fn default_database(&self, profile: &Profile) -> String {
         if let Some((active, _)) = self.active.as_ref().filter(|(active, _)| active.name == profile.name) { return active.database.clone(); }
         let scopes: Vec<_> = self.settings.browser_scopes.iter().filter(|scope| scope.profile == profile.name).collect();
@@ -454,11 +450,7 @@ impl Worker {
     fn show_all(&mut self) -> Result<String, String> {
         let browse = self.browse;
         let active = self.active.as_ref().map(|(profile, _)| profile.clone());
-        let profiles: Vec<Profile> = if browse.connections {
-            self.settings.profiles.clone()
-        } else {
-            active.iter().cloned().collect()
-        };
+        let profiles: Vec<Profile> = active.iter().cloned().collect();
         let scopes = cache::cached_scopes();
         let mut objects = Vec::new();
         let mut columns = Vec::new();
@@ -478,7 +470,6 @@ impl Worker {
                     let kind = match object.kind.as_str() { "view" => 1, "materialized_view" => 2, _ => 0 };
                     if self.settings.hidden_objects.iter().any(|hidden| hidden.scope.profile == profile.name && &hidden.scope.database == database && &hidden.scope.schema == schema && hidden.name == object.object_name && hidden.kind == kind) { continue; }
                     let mut segments = Vec::new();
-                    if browse.connections { segments.push(profile.name.as_str()); }
                     if *database != default_database { segments.push(database.as_str()); }
                     segments.extend([schema.as_str(), object.object_name.as_str()]);
                     let display = segments.join(".");
@@ -496,7 +487,6 @@ impl Worker {
         self.current_schema.clear();
         let zh = self.zh;
         update(&self.ui, move |ui| {
-            if browse.connections { ui.set_databases(with_all(zh, Vec::new())); }
             if browse.databases {
                 ui.set_database_index(0);
                 ui.set_schemas(with_all(zh, Vec::new()));
@@ -671,35 +661,6 @@ impl Worker {
         }
         Ok(client)
     }
-    /// Session for statements routed to another saved connection (`conn.table`).
-    async fn route_client(&mut self, name: &str) -> Result<Arc<tokio_postgres::Client>, String> {
-        let mut profile = self.settings.profiles.iter().find(|profile| profile.name == name).cloned()
-            .ok_or_else(|| self.message("连接已被删除", "Connection was removed"))?;
-        profile.database = self.default_database(&profile);
-        self.routes.retain(|(_, session)| !session.client.is_closed());
-        if let Some((_, session)) = self.routes.iter().find(|(saved, _)| saved == &profile) {
-            return Ok(session.client.clone());
-        }
-        self.routes.retain(|(saved, _)| saved.name != profile.name);
-        let password = config::password(&profile.name)?;
-        let session = guarded(db::connect(&profile, &password), self.cancelled.clone(), 20).await
-            .map_err(|error| if error.chars().all(|c| c.is_ascii_uppercase() || c == '_') { error } else { format!("[{name}] {error}") })?;
-        let client = session.client.clone();
-        self.routes.push((profile, session));
-        Ok(client)
-    }
-    async fn drop_route(&mut self, name: &str) {
-        let Some(index) = self.routes.iter().position(|(profile, _)| profile.name == name) else { return; };
-        let (profile, session) = self.routes.remove(index);
-        let token = session.client.cancel_token();
-        if profile.tls {
-            if let Ok(tls) = db::tls_connector(&profile) {
-                let _ = tokio::time::timeout(Duration::from_secs(3), token.cancel_query(postgres_native_tls::MakeTlsConnector::new(tls))).await;
-            }
-        } else {
-            let _ = tokio::time::timeout(Duration::from_secs(3), token.cancel_query(tokio_postgres::NoTls)).await;
-        }
-    }
     async fn scope_metadata(&mut self, profile: &Profile, sql: &str) -> Result<Vec<Cells>, String> {
         if let Some(rows) = self.metadata_cache.get(profile, sql) { return Ok(rows); }
         let password = config::password(&profile.name)?;
@@ -710,7 +671,12 @@ impl Worker {
     }
     async fn connect(&mut self, profile: Profile, password: String) -> Result<String, String> {
         // Results already shown in SQL tabs are kept; they do not depend on the browser connection.
-        self.disconnect();
+        if let (Some(saved), Some(session)) = (self.session_profile.take(), self.session.take()) {
+            if !session.client.is_closed() { self.idle_sessions.push((saved, session)); }
+        }
+        self.current_schema.clear();
+        self.browse = Browse::default();
+        self.all_index.clear();
         let scopes: Vec<_> = self.settings.browser_scopes.iter().filter(|scope| scope.profile == profile.name).collect();
         let mut profile = profile;
         if let Some(first) = scopes.first() {
@@ -718,13 +684,19 @@ impl Worker {
                 profile.database = first.database.clone();
             }
         }
+        self.idle_sessions.retain(|(_, session)| !session.client.is_closed());
+        if let Some(index) = self.idle_sessions.iter().position(|(saved, _)| saved == &profile) {
+            let (saved, session) = self.idle_sessions.remove(index);
+            self.session_profile = Some(saved);
+            self.session = Some(session);
+        }
         self.active = Some((profile.clone(), password));
-        self.ensure_session().await?;
         self.sync_prefixes();
         let label = format!("{} @ {} / {}", profile.user, profile.host, profile.database);
         let physical_index = self.physical_index(&self.settings.visible_profiles());
+        let connected = self.session.is_some();
         update(&self.ui, move |ui| {
-            ui.set_connected(true);
+            ui.set_connected(connected);
             ui.set_connection_label(label.into());
             ui.set_database(profile.database.clone().into());
             ui.set_physical_index(physical_index);
@@ -802,7 +774,7 @@ impl Worker {
         if self.active.as_ref().is_some_and(|(profile, _)| self.settings.browser_scopes.iter().any(|scope| scope.profile == profile.name) && !self.settings.browser_scopes.iter().any(|scope| scope.profile == profile.name && scope.database == profile.database && scope.schema == schema)) {
             return Err(self.message("此模式不在浏览范围内", "Schema is outside the browsing scope"));
         }
-        let changed = self.current_schema != schema || self.browse.any();
+        let context_changed = self.current_schema != schema || self.browse.any();
         if self.browse.any() {
             self.browse = Browse::default();
             self.all_index.clear();
@@ -810,17 +782,6 @@ impl Worker {
         }
         self.current_schema = schema.to_owned();
         self.sync_hidden();
-        if changed {
-            update(&self.ui, |ui| {
-                ui.set_objects(ModelRc::default());
-                ui.set_tables(ModelRc::default());
-                ui.set_fields(ModelRc::default());
-                ui.set_table_index(-1);
-                ui.set_table_count(0);
-                ui.set_view_count(0);
-                ui.set_mv_count(0);
-            });
-        }
         let objects = if schema.is_empty() { Vec::new() } else { self.load_objects(schema).await? };
         let columns = self.active.as_ref().map(|(profile, _)| {
             let scope = cache::load_scope(profile, schema);
@@ -846,9 +807,11 @@ impl Worker {
             ui.set_schema(selected.into());
             ui.set_column_index(strings(columns));
             ui.set_changed_tables(strings(changed));
-            ui.set_table_index(-1);
-            ui.set_fields(ModelRc::default());
-            ui.set_objects(std::rc::Rc::new(VecModel::from(objects)).into());
+            if context_changed || !ui.get_objects().iter().eq(objects.iter().cloned()) {
+                ui.set_table_index(-1);
+                ui.set_fields(ModelRc::default());
+                ui.set_objects(std::rc::Rc::new(VecModel::from(objects)).into());
+            }
             filter_objects(&ui);
         });
         self.remember_selection()?;
@@ -1064,7 +1027,7 @@ impl Worker {
                 *index = latest.profiles.iter().position(|profile| (!old.shared_id.is_empty() && profile.shared_id == old.shared_id) || profile.name == old.name).ok_or_else(|| self.message("连接已被删除，请重新打开连接设置", "Connection was removed; reopen connection settings"))?;
             }
             self.settings = latest;
-            self.sync_profiles();
+            if !is_switch(&command) { self.sync_profiles(); }
         }
         match command {
             Command::Cancel(_) | Command::CloseDocument(_) => Ok(String::new()),
@@ -1203,7 +1166,52 @@ impl Worker {
                 }
                 Ok(self.message("浏览范围已保存", "Browsing scope saved"))
             }
+            Command::Definition(id, schema, table, kind) => {
+                let result: Result<String, String> = async {
+                    let (profile, schema, table) = if schema.is_empty() {
+                        self.all_index.get(&table).cloned().ok_or_else(|| self.message("未找到对象所属的连接，请刷新后重试", "Object connection was not found; refresh and retry"))?
+                    } else {
+                        (self.active.as_ref().ok_or_else(|| self.message("请先选择连接", "Select a connection first"))?.0.clone(), schema, table)
+                    };
+                    let password = match &self.active {
+                        Some((active, password)) if active.name == profile.name => password.clone(),
+                        _ => config::password(&profile.name)?,
+                    };
+                    let session = guarded(db::connect(&profile, &password), self.cancelled.clone(), 20).await?;
+                    guarded(db::definition(&session.client, &schema, &table, kind, profile.redshift), self.cancelled.clone(), 60).await.map_err(|error| error.message)
+                }.await;
+                let text = result.unwrap_or_else(|error| format!("{}\n\n{}", self.message("加载定义失败", "Failed to load definition"), explain(self.zh, error)));
+                update(&self.ui, move |ui| ui.invoke_definition_loaded(id, text.into()));
+                Ok(String::new())
+            }
+            Command::RestoreScope(name, database, schema) => {
+                if name.is_empty() { return Ok(String::new()); }
+                let index = self.settings.profiles.iter().position(|profile| profile.name == name).ok_or("No profile")?;
+                let previous = self.settings.last_selection.clone();
+                self.settings.last_selection = Some(config::BrowserSelection { profile: name.clone(), database: database.clone(), schema: schema.clone() });
+                if self.active.as_ref().is_none_or(|(profile, _)| profile.name != name || profile.database != database) {
+                    let mut profile = self.settings.profiles[index].clone();
+                    profile.database = database;
+                    let password = config::password(&name)?;
+                    let shown = profile.clone();
+                    let shown_password = password.clone();
+                    update(&self.ui, move |ui| { ui.set_profile_index(index as i32); show_profile(&ui, shown, shown_password); });
+                    self.connect(profile, password).await?;
+                }
+                if self.current_schema != schema || self.browse.any() { self.tables(&schema).await?; }
+                let selected = self.current_schema.clone();
+                update(&self.ui, move |ui| {
+                    let index = ui.get_schemas().iter().position(|name| name == selected.as_str()).map_or(-1, |index| index as i32);
+                    ui.set_schema_index(index);
+                });
+                self.settings.last_selection = previous;
+                self.remember_selection()?;
+                Ok(String::new())
+            }
             Command::Connect(profile, password) => {
+                self.session = None;
+                self.session_profile = None;
+                self.idle_sessions.retain(|(saved, _)| saved != &profile);
                 self.connect(profile, password).await?;
                 self.ensure_session().await?;
                 Ok(self.message("连接成功", "Connected"))
@@ -1235,35 +1243,18 @@ impl Worker {
                     return Err(self.message("此库不在浏览范围内", "Database is outside the browsing scope"));
                 }
                 profile.database = database;
-                let selected = profile.database.clone();
-                let label = format!("{} @ {} / {}", profile.user, profile.host, profile.database);
-                self.active = Some((profile, password));
-                self.current_schema.clear();
-                self.browse = Browse::default();
-                self.all_index.clear();
-                self.sync_profiles();
-                update(&self.ui, move |ui| {
-                    ui.set_database(selected.into());
-                    ui.set_connection_label(label.into());
-                    ui.set_schemas(ModelRc::default());
-                    ui.set_schema("".into());
-                    ui.set_schema_index(-1);
-                    ui.set_objects(ModelRc::default());
-                    ui.set_tables(ModelRc::default());
-                    ui.set_fields(ModelRc::default());
-                    ui.set_table_index(-1);
-                });
-                self.refresh().await?;
+                self.connect(profile, password).await?;
                 Ok(self.message("已切换库名", "Database selected"))
             }
             Command::BrowseAll(level) => {
-                if level > 0 && self.active.is_none() {
+                if self.active.is_none() {
                     return Err(self.message("请先连接数据库", "Connect first"));
                 }
-                self.browse = Browse { connections: level == 0, databases: level <= 1, schemas: true };
+                self.browse = Browse { databases: level == 1, schemas: true };
                 self.show_all()
             }
             Command::Disconnect => {
+                self.idle_sessions.clear();
                 self.disconnect();
                 Ok(self.message("已断开连接", "Disconnected"))
             }
@@ -1411,66 +1402,30 @@ impl Worker {
                 if sql.len() > 2 * 1024 * 1024 {
                     return Err(self.message("SQL 超过 2 MiB 上限", "SQL exceeds 2 MiB"));
                 }
-                let connections: Vec<String> = self.settings.profiles.iter().map(|profile| profile.name.clone()).collect();
-                let default = self.active.as_ref().filter(|_| !self.browse.connections).map(|(profile, _)| profile.name.clone());
-                let batches = route::plan(&sql, &connections, default.as_deref()).map_err(|error| match error {
-                    route::RouteError::Missing(index, excerpt) => format!("{}\n{excerpt}", if self.browse.connections {
-                        tr(self.zh, &format!("第 {index} 条语句未指定连接。连接选择“全部”时，请用 连接.表名 指明连接。"), &format!("Statement {index} does not name a connection. With All connections selected, write connection.table."))
-                    } else { self.message("请先选择连接", "Select a connection first") }),
-                    route::RouteError::Mixed(index, names) => tr(self.zh,
-                        &format!("第 {index} 条语句引用了多个连接（{}）；一条语句只能查询一个连接。", names.join("、")),
-                        &format!("Statement {index} references several connections ({}); a statement can query only one connection.", names.join(", "))),
-                })?;
-                let deadline = Instant::now() + Duration::from_secs(timeout);
-                let mut result_labels = syntax::dq_labels(&sql, &mut 0).into_iter();
-                let several = batches.len() > 1;
+                let client = self.prepare_session().await?;
+                let labels = syntax::dq_labels(&sql, &mut 0);
                 self.sets.clear();
-                let mut sets: Vec<ResultSet> = Vec::new();
-                let mut received = 0;
-                for batch in batches {
-                    let labels: Vec<_> = result_labels.by_ref().take(syntax::dq_labels(&batch.sql, &mut 0).len()).collect();
-                    let remaining = deadline.saturating_duration_since(Instant::now()).as_secs().max(1);
-                    let primary = self.active.as_ref().is_some_and(|(profile, _)| profile.name == batch.connection);
-                    let client = if primary { self.prepare_session().await? } else { self.route_client(&batch.connection).await? };
-                    update_result(&self.ui, self.result_tab, |ui| ui.set_query_phase(1));
-                    let progress_ui = self.ui.clone();
-                    let document_id = self.result_tab;
-                    let base = received;
-                    let used: u64 = sets.iter().map(ResultSet::bytes).sum();
-                    let result = guarded(
-                        db::execute_limited(&client, &batch.sql, move |rows| {
-                            update_result(&progress_ui, document_id, move |ui| {
-                                ui.set_query_rows((base + rows).to_string().into());
-                                ui.set_query_phase(2);
-                            });
-                        }, usize::MAX, results::MAX_BYTES.saturating_sub(used)),
-                        self.cancelled.clone(),
-                        remaining,
-                    )
-                    .await;
-                    match result {
-                        Ok((mut batch_sets, _)) => {
-                            for set in &mut batch_sets {
-                                let mut names = Vec::new();
-                                for &statement in &set.statements {
-                                    if let Some(label) = labels.get(statement).filter(|label| !label.is_empty()) {
-                                        names.push(label.clone());
-                                    }
-                                }
-                                set.name = names.join(" / ");
-                            }
-                            received += batch_sets.iter().filter(|set| !set.status).map(|set| set.count).sum::<usize>();
-                            sets.extend(batch_sets);
-                            if sets.len() > 32 { return Err("LIMIT_COLUMNS".into()); }
-                        }
-                        Err(error) => {
-                            if !error.recoverable {
-                                if primary { self.invalidate().await; } else { self.drop_route(&batch.connection).await; }
-                            }
-                            let code = error.message.chars().all(|c| c.is_ascii_uppercase() || c == '_');
-                            return Err(if several && !code { format!("[{}] {}", batch.connection, error.message) } else { error.message });
-                        }
+                update_result(&self.ui, self.result_tab, |ui| ui.set_query_phase(1));
+                let progress_ui = self.ui.clone();
+                let document_id = self.result_tab;
+                let result = guarded(
+                    db::execute_limited(&client, &sql, move |rows| {
+                        update_result(&progress_ui, document_id, move |ui| {
+                            ui.set_query_rows(rows.to_string().into());
+                            ui.set_query_phase(2);
+                        });
+                    }, usize::MAX, results::MAX_BYTES),
+                    self.cancelled.clone(), timeout,
+                ).await;
+                let mut sets = match result {
+                    Ok((sets, _)) => sets,
+                    Err(error) => {
+                        if !error.recoverable { self.invalidate().await; }
+                        return Err(error.message);
                     }
+                };
+                for set in &mut sets {
+                    set.name = set.statements.iter().filter_map(|&statement| labels.get(statement).filter(|label| !label.is_empty())).cloned().collect::<Vec<_>>().join(" / ");
                 }
                 self.sets = sets;
                 let names = self.sets.iter().enumerate()
@@ -1836,8 +1791,8 @@ fn submit(
     let field_selection = matches!(&command, Command::Fields(_, _, action) if action.is_empty());
     let switch = is_switch(&command);
     // Running queries own their sessions, so switching the browser connection does not affect them.
-    if (ui.get_busy() && !cancel_request) || (query && ui.get_query_running())
-        || (ui.get_switching() && !is_result_command(&command)) {
+    if (ui.get_busy() && !cancel_request && !matches!(&command, Command::RestoreScope(..))) || (query && ui.get_query_running())
+        || (ui.get_switching() && !is_result_command(&command) && !matches!(&command, Command::RestoreScope(..))) {
         return;
     }
     let zh = ui.global::<I18n>().get_zh();
@@ -1909,14 +1864,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_profiles(strings(
         settings.profiles.iter().map(|p| p.name.clone()).collect(),
     ));
-    ui.set_visible_profiles(with_all(zh, settings.visible_profiles()));
+    ui.set_visible_profiles(strings(settings.visible_profiles()));
     prefix_options(&ui);
     let restore_index = settings.last_selection.as_ref().and_then(|last| {
         settings
             .profiles
             .iter()
             .position(|p| p.name == last.profile)
-    });
+    }).or_else(|| (!settings.profiles.is_empty()).then_some(0));
     if let Some(error) = &error {
         ui.set_failed(true);
         ui.set_status(error.as_str().into());
@@ -1963,6 +1918,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Request>(64);
     let weak = ui.as_weak();
+    let sender = tx.clone();
+    let cancel = cancelled.clone();
+    ui.on_restore_query_scope(move |profile, database, schema| {
+        if let Some(ui) = weak.upgrade() {
+            submit(&ui, &sender, &cancel, Command::RestoreScope(profile.to_string(), database.to_string(), schema.to_string()));
+        }
+    });
+    let weak = ui.as_weak();
     let cancel = cancelled.clone();
     let worker = std::thread::Builder::new()
         .name("sql-worker".into())
@@ -1998,7 +1961,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     current_schema: String::new(),
                     metadata_cache: cache::MetadataCache::load(),
                     query_only: false,
-                    routes: Vec::new(),
+                    idle_sessions: Vec::new(),
                     browse: Browse::default(),
                     all_index: std::collections::HashMap::new(),
                 };
@@ -2008,6 +1971,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Connection/browser changes run here; runs submitted meanwhile wait in `pending`.
                 let mut switches = tokio::task::JoinSet::<(Worker, Result<String, String>, Finish)>::new();
                 let mut pending: Vec<Request> = Vec::new();
+                let mut pending_scope: Option<Request> = None;
                 let mut cancellations = std::collections::HashMap::<i32, Arc<AtomicBool>>::new();
                 let mut open_documents = std::collections::HashSet::new();
                 let mut heartbeat = tokio::time::interval(Duration::from_millis(250));
@@ -2016,12 +1980,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut last_reconnect = Instant::now();
                 loop {
                     let request = tokio::select! {
+                        _ = async {}, if pending_scope.is_some() && switches.is_empty() => pending_scope.take().unwrap(),
                         request = rx.recv() => { let Some(request) = request else { break; }; request },
                         completed = queries.join_next(), if !queries.is_empty() => {
                             if let Some(Ok((id, mut query, result, started))) = completed {
                                 cancellations.remove(&id);
                                 if !open_documents.contains(&id) { continue; }
-                                sessions.insert(id, TabSessions { session: query.session.take(), profile: query.session_profile.take(), routes: std::mem::take(&mut query.routes) });
+                                sessions.insert(id, TabSessions { session: query.session.take(), profile: query.session_profile.take() });
                                 let previous = if worker.result_tab == id { std::mem::take(&mut worker.sets) } else { worker.tab_sets.remove(&id).unwrap_or_default() };
                                 let (history, selected) = histories.entry(id).or_default();
                                 if let Some(slot) = history.get_mut(*selected) { *slot = previous; }
@@ -2031,7 +1996,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if worker.result_tab == id { worker.sets = std::mem::take(&mut query.sets); }
                                 else { worker.tab_sets.insert(id, std::mem::take(&mut query.sets)); }
                                 let elapsed = started.elapsed().as_secs_f32();
+                                let scope = if result.is_ok() { query.active.as_ref().map(|(profile, _)| (profile.name.clone(), profile.database.clone(), query.current_schema.clone())) } else { None };
                                 update_result(&worker.ui, id, move |ui| {
+                                    if let Some((profile, database, schema)) = scope { ui.invoke_query_scope_succeeded(id, profile.into(), database.into(), schema.into()); }
                                     ui.set_query_running(false);
                                     ui.set_query_elapsed(elapsed);
                                     ui.set_query_phase(if result.is_ok() { 3 } else { 4 });
@@ -2046,17 +2013,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Some(Ok((mut browser, result, finish))) => {
                                     worker.session = browser.session.take();
                                     worker.session_profile = browser.session_profile.take();
+                                    worker.idle_sessions = std::mem::take(&mut browser.idle_sessions);
                                     worker.active = browser.active.take();
                                     worker.current_schema = std::mem::take(&mut browser.current_schema);
                                     worker.metadata_cache = std::mem::take(&mut browser.metadata_cache);
                                     worker.settings = std::mem::take(&mut browser.settings);
                                     worker.browse = browser.browse;
                                     worker.all_index = std::mem::take(&mut browser.all_index);
+                                    worker.sync_profiles();
+                                    if result.is_ok() { last_reconnect = Instant::now() - Duration::from_secs(5); }
                                     finish_request(&mut worker, &mut prefetches, finish, result);
                                 }
                                 _ => update(&worker.ui, |ui| { ui.set_switching(false); ui.set_browser_refresh(0); }),
                             }
-                            for request in std::mem::take(&mut pending) {
+                            for request in if pending_scope.is_none() { std::mem::take(&mut pending) } else { Vec::new() } {
                                 if open_documents.contains(&request.document_id) {
                                     spawn_query(&worker, request, &mut queries, &mut sessions, &mut cancellations);
                                 }
@@ -2166,7 +2136,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                     if is_switch(&request.command) {
-                        if !switches.is_empty() { continue; }
+                        if !switches.is_empty() {
+                            if matches!(&request.command, Command::RestoreScope(..)) { pending_scope = Some(request); }
+                            continue;
+                        }
                         worker.zh = request.zh;
                         let finish = Finish::new(&request.command);
                         let mut browser = Worker {
@@ -2174,7 +2147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             session_profile: worker.session_profile.take(), active: worker.active.clone(), sets: Vec::new(),
                             tab_sets: std::collections::HashMap::new(), result_tab: worker.result_tab, cancelled: worker.cancelled.clone(),
                             zh: worker.zh, settings_error: worker.settings_error.clone(), current_schema: worker.current_schema.clone(),
-                            metadata_cache: std::mem::take(&mut worker.metadata_cache), query_only: false, routes: Vec::new(),
+                            metadata_cache: std::mem::take(&mut worker.metadata_cache), query_only: false, idle_sessions: std::mem::take(&mut worker.idle_sessions),
                             browse: worker.browse, all_index: std::mem::take(&mut worker.all_index),
                         };
                         let command = request.command;
@@ -2228,6 +2201,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if documents::action(&ui, &document_state, &action) { return; }
         if ui.get_save_prompt_open() { return; }
+        if ui.get_document_read_only() && matches!(action.as_str(), "run" | "generate-group" | "quick-limit" | "history-prev" | "history-next") { return; }
+        if action == "view-definition" {
+            if ui.get_busy() || ui.get_switching() || ui.get_document_saving() { return; }
+            if let Some(table) = ui.get_tables().row_data(ui.get_table_index() as usize) {
+                let schema = ui.get_schema().to_string();
+                let title = if schema.is_empty() { table.text.to_string() } else { format!("{schema}.{}", table.text) };
+                if let Some(id) = documents::open_definition(&ui, &document_state, title) {
+                    submit(&ui, &sender, &cancel, Command::Definition(id, schema, table.text.to_string(), ui.get_object_kind()));
+                }
+            }
+            return;
+        }
         if action == "add-scope" {
             use slint::Model;
             let additions: Vec<BrowserScope> = ui.get_scope_schemas().row_data(ui.get_scope_schema_index() as usize).into_iter()
@@ -2523,10 +2508,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.on_physical_selected(move |index| {
         use slint::Model;
         if let Some(ui) = weak.upgrade() {
-            if index == 0 {
-                submit(&ui, &sender, &cancel, Command::BrowseAll(0));
-                return;
-            }
             if let Some(name) = ui.get_visible_profiles().row_data(index as usize) {
                 if let Some(index) = ui.get_profiles().iter().position(|profile| profile == name) {
                     submit(&ui, &sender, &cancel, Command::UseProfile(index));
@@ -2548,8 +2529,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let index: Vec<(String, Vec<String>)> = ui.get_column_index().iter().filter_map(|entry| serde_json::from_str(entry.as_str()).ok()).collect();
         let tables: Vec<_> = ui.get_tables().iter().map(|object| (object.text.to_string(), index.iter().find(|(name, _)| name == object.text.as_str()).map(|(_, columns)| columns.clone()).unwrap_or_default())).collect();
         let mut missing = None;
-        let connection = (ui.get_physical_index() > 0).then(|| ui.get_visible_profiles().row_data(ui.get_physical_index() as usize)).flatten();
-        let suggestions = completion::suggest(&sql, offset.max(0) as usize, &tables, &ui.get_schema(), connection.as_deref(), &mut missing);
+        let suggestions = completion::suggest(&sql, offset.max(0) as usize, &tables, &ui.get_schema(), &mut missing);
         if let Some(table) = missing.filter(|_| !ui.get_busy() && !ui.get_switching() && ui.get_connected()) {
             submit(&ui, &completion_sender, &completion_cancel, Command::Fields(ui.get_schema().to_string(), table, "completion".into()));
         }
@@ -2649,6 +2629,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 matches.iter().position(|&start| (start as i32) > current).unwrap_or(0)
             };
             SearchMatch { start: matches[index] as i32, end: (matches[index] + needle.len()) as i32, count: matches.len() as i32, ordinal: index as i32 + 1 }
+        }
+    });
+    let measure_ui = ui.as_weak();
+    ui.on_sql_line_measured(move |sql, index, y| {
+        let Some(ui) = measure_ui.upgrade() else { return; };
+        if ui.get_sql() != sql || ui.get_highlighted_sql() != sql { return; }
+        let Some(line) = ui.get_sql_lines().row_data(index as usize) else { return; };
+        if let Some(mut run) = line.row_data(0) {
+            if run.source != sql { return; }
+            if run.line_y != y { run.line_y = y; line.set_row_data(0, run); }
         }
     });
     ui.on_highlight(move |sql| {
@@ -2894,6 +2884,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         use slint::winit_030::{WinitWindowAccessor, EventResult, winit::event::{WindowEvent, ElementState, TouchPhase, Touch}};
         let weak = ui.as_weak();
         ui.window().on_winit_window_event(move |_, event| {
+            if matches!(event, WindowEvent::ScaleFactorChanged { .. }) {
+                let weak = weak.clone();
+                slint::Timer::single_shot(Duration::ZERO, move || {
+                    if let Some(ui) = weak.upgrade() { ui.set_highlighted_sql("".into()); ui.invoke_highlight(ui.get_sql()); }
+                });
+            }
             if matches!(event, WindowEvent::Focused(true)) {
                 if let Some(ui) = weak.upgrade() { ui.invoke_dismiss_notification(); }
             }

@@ -132,25 +132,25 @@ impl MetadataCache {
     }
     pub fn changed_tables(&self, profile: &Profile, schema: &str, objects: &[crate::DbObject]) -> Vec<String> {
         let mut changed = Vec::new();
-        if let Some(scope) = load_scope(profile, schema) {
-            if let Some(previous) = &scope.previous_fields {
-                for object in objects {
-                    let current = scope.fields.iter().filter(|row| row.first().and_then(|cell| cell.as_deref()) == Some(object.name.as_str())).map(|row| row.get(1..3));
-                    let old = previous.iter().filter(|row| row.first().and_then(|cell| cell.as_deref()) == Some(object.name.as_str())).map(|row| row.get(1..3));
-                    if !current.eq(old) { changed.push(object.name.to_string()); }
+        let scope = load_scope(profile, schema);
+        let snapshot = scope.as_ref().map(|scope| (&scope.fields, scope.previous_fields.as_ref())).or_else(|| {
+            self.entries.get(&key(profile, &crate::db::columns_sql(schema, None, profile.redshift))).map(|entry| (&entry.rows, entry.previous.as_ref()))
+        });
+        if let Some((rows, Some(previous))) = snapshot {
+            let mut current = std::collections::HashMap::<&str, Vec<_>>::new();
+            let mut old = std::collections::HashMap::<&str, Vec<_>>::new();
+            for (rows, grouped) in [(rows, &mut current), (previous, &mut old)] {
+                for row in rows {
+                    if let Some(table) = row.first().and_then(|cell| cell.as_deref()) {
+                        grouped.entry(table).or_default().push(row.get(1..3));
+                    }
                 }
             }
-            return changed;
-        }
-        if let Some(entry) = self.entries.get(&key(profile, &crate::db::columns_sql(schema, None, profile.redshift))) {
-            if let Some(previous) = &entry.previous {
-                for object in objects {
-                    let current = entry.rows.iter().filter(|row| row.first().and_then(|cell| cell.as_deref()) == Some(object.name.as_str())).map(|row| row.get(1..3));
-                    let old = previous.iter().filter(|row| row.first().and_then(|cell| cell.as_deref()) == Some(object.name.as_str())).map(|row| row.get(1..3));
-                    if !current.eq(old) { changed.push(object.name.to_string()); }
-                }
+            for object in objects {
+                if current.get(object.name.as_str()) != old.get(object.name.as_str()) { changed.push(object.name.to_string()); }
             }
         }
+        if scope.is_some() { return changed; }
         let identity = connection(profile);
         let schema = crate::db::literal(schema, profile.redshift);
         for (saved_key, entry) in &self.entries {
