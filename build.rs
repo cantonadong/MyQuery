@@ -1,3 +1,7 @@
+#[cfg(not(feature = "gui"))]
+fn main() {}
+
+#[cfg(feature = "gui")]
 fn main() {
     slint_build::compile("ui/main.slint").expect("compile Slint UI");
     let object = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("app-icon.o");
