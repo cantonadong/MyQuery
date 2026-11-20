@@ -9,8 +9,18 @@ build = "build.rs"
 name = "myquery_core"
 crate-type = ["rlib", "cdylib"]
 
+[[bin]]
+name = "sql-desk"
+path = "src/main.rs"
+required-features = ["gui"]
+
+# The desktop app needs "gui"; `--no-default-features --lib` builds only the query core (e.g. Linux .so for MyBI server).
+[features]
+default = ["gui"]
+gui = ["dep:slint", "dep:slint-build", "dep:rfd", "dep:arboard", "dep:keyring", "dep:sys-locale", "dep:windows-sys"]
+
 [dependencies]
-slint = { version = "1.15", default-features = false, features = ["std", "backend-winit", "unstable-winit-030", "renderer-software", "compat-1-2"] }
+slint = { version = "1.15", optional = true, default-features = false, features = ["std", "backend-winit", "unstable-winit-030", "renderer-software", "compat-1-2"] }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 tokio-postgres = "0.7"
 native-tls = "0.2"
@@ -20,14 +30,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 csv = "1"
-rfd = "0.15"
-arboard = { version = "3", default-features = false }
-keyring = { version = "3", features = ["windows-native"] }
-sys-locale = "0.3"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Cryptography", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+rfd = { version = "0.15", optional = true }
+arboard = { version = "3", optional = true, default-features = false }
+keyring = { version = "3", optional = true, features = ["windows-native"] }
+sys-locale = { version = "0.3", optional = true }
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Cryptography", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+
+# Linux builds bundle OpenSSL so one prebuilt .so runs on any distro regardless of its OpenSSL version.
+[target.'cfg(target_os = "linux")'.dependencies]
+native-tls = { version = "0.2", features = ["vendored"] }
 
 [build-dependencies]
-slint-build = "1.15"
+slint-build = { version = "1.15", optional = true }
 
 [profile.release]
 opt-level = "s"

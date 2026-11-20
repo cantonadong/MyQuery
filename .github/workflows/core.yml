@@ -1,0 +1,52 @@
+# Builds the shared query core for Windows and Linux from one source and publishes both files
+# to the "core" release, where MyBI's installers download them.
+name: Query core
+
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'Cargo.toml', 'Cargo.lock', 'build.rs', '.github/workflows/core.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            file: myquery_core.dll
+            rustflags: -C target-feature=+crt-static  # no Visual C++ runtime needed on the target PC
+          # Oldest supported runner = oldest glibc, so the .so also loads on older distros.
+          - os: ubuntu-22.04
+            file: libmyquery_core.so
+            rustflags: ''
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --lib --release --locked --no-default-features
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.file }}
+          path: target/release/${{ matrix.file }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - run: |
+          gh release view core -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 || \
+            gh release create core -R "$GITHUB_REPOSITORY" --title "Query core (latest build)" \
+              --notes "Built automatically from main. Download myquery_core.dll (Windows) or libmyquery_core.so (Linux)."
+          gh release upload core out/myquery_core.dll out/libmyquery_core.so --clobber -R "$GITHUB_REPOSITORY"

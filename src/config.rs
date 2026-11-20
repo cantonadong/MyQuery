@@ -171,6 +171,14 @@ pub fn save(settings: &Settings) -> Result<(), String> {
     Ok(())
 }
 
+// Desktop-only password store (Windows DPAPI + keyring); the query core gets passwords from its caller.
+#[cfg(feature = "gui")]
+pub use secrets::{delete_password, password, save_password};
+
+#[cfg(feature = "gui")]
+mod secrets {
+use super::*;
+
 pub fn password(name: &str) -> Result<String, String> {
     let _lock = password_lock()?;
     let mut stored = passwords()?;
@@ -276,7 +284,7 @@ fn save_passwords(passwords: &BTreeMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
-fn protect(data: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
+pub(super) fn protect(data: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::Cryptography::{
@@ -332,9 +340,11 @@ fn protect(data: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
     }
 }
 
-#[cfg(test)]
+}
+
+#[cfg(all(test, feature = "gui"))]
 mod tests {
-    use super::protect;
+    use super::secrets::protect;
     #[test]
     fn encrypted_password_data_round_trips_and_rejects_corruption() {
         let plain = "{\"连接\":\"secret-密码\"}".as_bytes();
