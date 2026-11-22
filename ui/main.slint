@@ -337,24 +337,6 @@ export component AppWindow inherits Window {
     callback sync-language-menu();
     sync-language-menu => { root.chinese-checked = I18n.zh; root.english-checked = !I18n.zh; }
     sync-theme-menu => { root.light-checked = !Theme.dark; root.dark-checked = Theme.dark; }
-    MenuBar {
-        Menu {
-            title: I18n.t("设置", "Settings"); enabled: !root.save-prompt-open;
-            MenuItem { title: I18n.t("连接配置…", "Connections…"); enabled: !root.browser-busy; activated => { root.config-open = true; root.timeout-open = false; root.group-open = false; } }
-            MenuItem { title: I18n.t("浏览范围…", "Browsing scope…"); enabled: !root.browser-busy; activated => { root.action("scope-settings"); } }
-            MenuItem { title: I18n.t("查询超时…", "Query timeout…"); enabled: !root.browser-busy; activated => { root.timeout-input = root.timeout; root.timeout-open = true; root.config-open = false; root.group-open = false; } }
-            Menu {
-                title: I18n.t("主题", "Theme"); enabled: !root.browser-busy;
-                MenuItem { title: I18n.t("浅色（Light）", "Light"); checkable: true; checked <=> root.light-checked; enabled: !root.browser-busy; activated => { root.theme-selected(false); root.sync-theme-menu(); } }
-                MenuItem { title: I18n.t("深色（Dark）", "Dark"); checkable: true; checked <=> root.dark-checked; enabled: !root.browser-busy; activated => { root.theme-selected(true); root.sync-theme-menu(); } }
-            }
-            Menu {
-                title: I18n.t("语言", "Language"); enabled: !root.browser-busy;
-                MenuItem { title: "简体中文"; checkable: true; checked <=> root.chinese-checked; enabled: !root.browser-busy; activated => { I18n.zh = true; root.sync-language-menu(); root.language-changed(); } }
-                MenuItem { title: "English"; checkable: true; checked <=> root.english-checked; enabled: !root.browser-busy; activated => { I18n.zh = false; root.sync-language-menu(); root.language-changed(); } }
-            }
-        }
-    }
     VerticalLayout {
         x: 0px; y: 0px; width: 100%; height: 100%;
         spacing: 0px;
@@ -382,6 +364,29 @@ export component AppWindow inherits Window {
                 HorizontalBox { spacing: Theme.control-gap; padding: 0px;
                 Caption { width: I18n.zh ? 42px : 78px; text: I18n.t("连接", "Connection"); }
                 SelectBox { height: 24px; dim-disabled: false; model: root.visible-profiles; current-index <=> root.physical-index; enabled: !root.browser-busy; selected(value) => { root.physical-selected(self.current-index); } }
+                IconButton {
+                    height: 24px; width: 24px; icon-size: 16px; icon: @image-url("icons/settings.svg"); accessible-label: I18n.t("设置", "Settings"); enabled: !root.save-prompt-open;
+                    clicked => { root.sync-theme-menu(); root.sync-language-menu(); settings-menu.show({ x: 0px, y: self.height }); }
+                    Tooltip { text: @markdown("\{I18n.t("设置", "Settings")}"); }
+                    settings-menu := ContextMenuArea {
+                        enabled: !root.save-prompt-open;
+                        Menu {
+                            MenuItem { title: I18n.t("连接配置…", "Connections…"); enabled: !root.browser-busy; activated => { root.config-open = true; root.timeout-open = false; root.group-open = false; } }
+                            MenuItem { title: I18n.t("浏览范围…", "Browsing scope…"); enabled: !root.browser-busy; activated => { root.action("scope-settings"); } }
+                            MenuItem { title: I18n.t("查询超时…", "Query timeout…"); enabled: !root.browser-busy; activated => { root.timeout-input = root.timeout; root.timeout-open = true; root.config-open = false; root.group-open = false; } }
+                            Menu {
+                                title: I18n.t("主题", "Theme"); enabled: !root.browser-busy;
+                                MenuItem { title: I18n.t("浅色（Light）", "Light"); checkable: true; checked <=> root.light-checked; enabled: !root.browser-busy; activated => { root.theme-selected(false); root.sync-theme-menu(); } }
+                                MenuItem { title: I18n.t("深色（Dark）", "Dark"); checkable: true; checked <=> root.dark-checked; enabled: !root.browser-busy; activated => { root.theme-selected(true); root.sync-theme-menu(); } }
+                            }
+                            Menu {
+                                title: I18n.t("语言", "Language"); enabled: !root.browser-busy;
+                                MenuItem { title: "简体中文"; checkable: true; checked <=> root.chinese-checked; enabled: !root.browser-busy; activated => { I18n.zh = true; root.sync-language-menu(); root.language-changed(); } }
+                                MenuItem { title: "English"; checkable: true; checked <=> root.english-checked; enabled: !root.browser-busy; activated => { I18n.zh = false; root.sync-language-menu(); root.language-changed(); } }
+                            }
+                        }
+                    }
+                }
                 }
                 HorizontalBox { spacing: Theme.control-gap; padding: 0px;
                 Caption { width: I18n.zh ? 42px : 78px; text: I18n.t("库名", "Database"); }
@@ -777,7 +782,6 @@ export component AppWindow inherits Window {
                                 spacing: Theme.control-gap; alignment: start;
                                 IconButton { icon: root.copy-headers ? @image-url("icons/headers.svg") : @image-url("icons/headers-off.svg"); checked: root.copy-headers; accessible-label: I18n.t("复制标题行", "Copy headers"); accessible-checkable: true; accessible-checked: root.copy-headers; clicked => { root.copy-headers = !root.copy-headers; } Tooltip { text: @markdown("\{I18n.t("复制标题行", "Copy headers")}"); } }
                                 IconButton { icon: @image-url("icons/export.svg"); accessible-label: I18n.t("导出", "Export"); enabled: !root.busy && root.result-index >= 0; clicked => { root.action("export"); } Tooltip { text: @markdown("\{I18n.t("导出", "Export")}"); } }
-                                IconButton { icon: @image-url("icons/copy.svg"); accessible-label: I18n.t("复制", "Copy"); enabled: root.displayed-error != "" || (!root.busy && root.result-index >= 0); clicked => { root.action(root.displayed-error != "" ? "copy-error" : "copy-all"); } Tooltip { text: @markdown("\{I18n.t("复制", "Copy")}"); } }
                                 CompactButton { width: 24px; text: "<"; accessible-label: I18n.t("上一次执行", "Previous run"); enabled: !root.busy && !root.query-running && root.history-index > 0; clicked => { root.action("history-prev"); } }
                                 CompactButton { width: 24px; text: ">"; accessible-label: I18n.t("下一次执行", "Next run"); enabled: !root.busy && !root.query-running && root.history-index + 1 < root.history-count; clicked => { root.action("history-next"); } }
                                 if root.displayed-error != "" && root.result-index >= 0: IconButton {
@@ -785,6 +789,7 @@ export component AppWindow inherits Window {
                                     clicked => { root.failed = false; root.query-error = ""; }
                                     Tooltip { text: @markdown("\{I18n.t("返回数据结果", "Return to results")}"); }
                                 }
+                                IconButton { icon: @image-url("icons/copy.svg"); accessible-label: I18n.t("复制", "Copy"); enabled: root.displayed-error != "" || (!root.busy && root.result-index >= 0); clicked => { root.action(root.displayed-error != "" ? "copy-error" : "copy-all"); } Tooltip { text: @markdown("\{I18n.t("复制", "Copy")}"); } }
                             }
                         }
                         VerticalBox {
