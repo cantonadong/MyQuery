@@ -1818,6 +1818,12 @@ fn submit(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Slint's script fallback for Han picks a font missing many simplified glyphs (导/认/执); make YaHei the generic fallback.
+    let yahei = std::path::Path::new(r"C:\Windows\Fonts\msyh.ttc");
+    if std::env::var_os("SLINT_FONT_PATH").is_none() && yahei.is_file() {
+        // SAFETY: runs first in main, before any other thread exists.
+        unsafe { std::env::set_var("SLINT_FONT_PATH", yahei) };
+    }
     slint::BackendSelector::new().with_winit_window_attributes_hook(|attributes| attributes.with_active(false)).select()?;
     let ui = AppWindow::new()?;
     ui.on_format_count(|count| {
