@@ -1,4 +1,4 @@
-import { ScrollView, LineEdit, HorizontalBox } from "std-widgets.slint";
+import { ScrollView, HorizontalBox } from "std-widgets.slint";
 import { ActionButton, PopupMenu, PopupRow } from "controls.slint";
 import { Theme } from "theme.slint";
 
@@ -205,34 +205,40 @@ export component SqlEditor inherits Rectangle {
     Rectangle {
         visible: root.find-open;
         x: parent.width - self.width - 6px; y: 6px;
-        width: min(420px, parent.width - 12px); height: 44px;
+        width: min(420px, parent.width - 12px); height: 36px;
         background: Theme.panel; border-width: 1px; border-color: Theme.border; border-radius: Theme.control-radius;
         TouchArea {}
-        HorizontalBox { padding: 6px; spacing: Theme.control-gap;
-        search-input := LineEdit {
-            height: 32px;
-            text <=> root.needle;
-            changed has-focus => { if self.has-focus { self.select-all(); } }
-            placeholder-text: root.zh ? "查找 SQL" : "Find in SQL";
-            edited => { root.refresh-find(true); }
-            accepted => { root.find-next(false); }
-            key-pressed(event) => {
-                if event.text == Key.Escape { root.close-find(); return accept; }
-                if event.text == Key.Return && event.modifiers.shift { root.find-next(true); return accept; }
-                return reject;
-            }
-        }
-        Text { text: root.found.ordinal + " / " + root.found.count; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
-        Rectangle { width: 24px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "↑"; label: root.zh ? "上一处" : "Previous match"; enabled: root.found.count > 0; clicked => { root.find-next(true); } } }
-        Rectangle { width: 24px; height: 32px; horizontal-stretch: 0; FindButton { y: 4px; text: "↓"; label: root.zh ? "下一处" : "Next match"; enabled: root.found.count > 0; clicked => { root.find-next(false); } } }
-        Rectangle { width: 24px; height: 32px; horizontal-stretch: 0;
+        HorizontalBox { padding: 6px; spacing: Theme.control-gap; alignment: stretch;
             Rectangle {
-                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                width: Theme.inline-button-size; height: Theme.inline-button-size;
+                height: 24px; horizontal-stretch: 1;
+                background: Theme.surface; border-width: 1px; border-radius: Theme.control-radius;
+                border-color: search-input.has-focus ? Theme.focus : Theme.border;
+                forward-focus: search-input;
+                Text { x: 3px; width: parent.width - 6px; height: 100%; visible: root.needle == ""; text: root.zh ? "查找 SQL" : "Find in SQL"; color: Theme.muted; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                search-input := TextInput {
+                    x: 3px; width: parent.width - 6px; height: 100%;
+                    text <=> root.needle; single-line: true; font-size: 12px; color: Theme.text; vertical-alignment: center;
+                    accessible-label: root.zh ? "查找 SQL" : "Find in SQL";
+                    selection-background-color: Theme.selection; selection-foreground-color: white;
+                    changed has-focus => { if self.has-focus { self.select-all(); } }
+                    edited => { root.refresh-find(true); }
+                    accepted => { root.find-next(false); }
+                    key-pressed(event) => {
+                        if event.text == Key.Escape { root.close-find(); return accept; }
+                        if event.text == Key.Return && event.modifiers.shift { root.find-next(true); return accept; }
+                        return reject;
+                    }
+                }
+            }
+            Text { height: 24px; text: root.found.ordinal + " / " + root.found.count; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
+            FindButton { text: "↑"; label: root.zh ? "上一处" : "Previous match"; enabled: root.found.count > 0; clicked => { root.find-next(true); } }
+            FindButton { text: "↓"; label: root.zh ? "下一处" : "Next match"; enabled: root.found.count > 0; clicked => { root.find-next(false); } }
+            Rectangle {
+                width: 24px; height: 24px; horizontal-stretch: 0;
                 border-width: 1px; border-radius: Theme.control-radius;
-                border-color: close-touch.has-hover ? Theme.destructive : close-focus.has-focus ? Theme.focus : transparent;
-                background: close-touch.has-hover ? Theme.destructive : transparent;
-                Image { x: (parent.width - 12px) / 2; y: (parent.height - 12px) / 2; width: 12px; height: 12px; source: @image-url("icons/close.svg"); image-fit: contain; colorize: close-touch.has-hover ? white : Theme.dark ? Theme.heading : transparent; }
+                border-color: close-touch.has-hover ? Theme.destructive : close-focus.has-focus ? Theme.focus : Theme.border;
+                background: close-touch.has-hover ? Theme.destructive : Theme.surface;
+                Image { x: (parent.width - 16px) / 2; y: (parent.height - 16px) / 2; width: 16px; height: 16px; source: @image-url("icons/close.svg"); image-fit: contain; colorize: close-touch.has-hover ? white : Theme.dark ? Theme.heading : transparent; }
                 accessible-role: button; accessible-label: root.zh ? "关闭查找" : "Close find";
                 accessible-action-default => { root.close-find(); }
                 close-focus := FocusScope {
@@ -242,7 +248,6 @@ export component SqlEditor inherits Rectangle {
                 }
             }
         }
-    }
     }
 
 }

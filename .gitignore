@@ -1,6 +1,7 @@
 /target/
 /SqlDesk.exe
 /MyQuery.exe
+/query-history/
 /passwords.dat
 /passwords.lock
 /SqlDesk.exe.lnk

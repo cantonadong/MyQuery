@@ -453,6 +453,7 @@ pub fn bind(ui: &AppWindow) -> Rc<RefCell<Documents>> {
                         else if doc.notice == 1 { tr(ui.global::<I18n>().get_zh(), "成功", "Success") }
                         else { tr(ui.global::<I18n>().get_zh(), "错误", "Error") };
                     let message = format!("{} · {status} · {:.2}s", doc.title(), ui.get_query_elapsed());
+                    if let Some(previous) = docs.notification.take() { let _ = previous.hide(); }
                     docs.notification = crate::dialogs::notify_result(&ui, &message);
                 }
             }

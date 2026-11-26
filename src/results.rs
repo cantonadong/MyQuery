@@ -234,6 +234,17 @@ impl ResultSet {
         Ok(())
     }
 
+    #[cfg(feature = "gui")]
+    pub fn archive(&mut self, path: &Path) -> Result<(), String> {
+        self.finish()?;
+        self.file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        let mut target = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
+        serde_json::to_writer(&mut target, &self.headers).map_err(|e| e.to_string())?;
+        target.write_all(b"\n").map_err(|e| e.to_string())?;
+        std::io::copy(&mut self.file, &mut target).map_err(|e| e.to_string())?;
+        target.flush().map_err(|e| e.to_string())
+    }
+
     pub fn export(&mut self, path: &Path, cancelled: impl Fn() -> bool) -> Result<(), String> {
         self.finish()?;
         let dir = path.parent().ok_or("Invalid export path")?;

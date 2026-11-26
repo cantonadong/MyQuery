@@ -228,10 +228,13 @@ enum Command {
     SavePrefixes(Vec<String>, Option<String>),
     SetObjectHidden(String, i32, bool),
     Language(bool),
+    OpenQueryArchive,
+    ToggleQueryArchive,
+    SetQueryArchiveFolder { reset: bool },
     Theme(bool),
     SaveTimeout(u64),
     Tables(String),
-    Fields(String, String, String),
+    Fields(String, Vec<String>, String),
     Refresh,
     RefreshSchema,
     Reconnect,
@@ -309,7 +312,7 @@ impl Finish {
     fn new(command: &Command) -> Self {
         Self {
             selected_fields: match command {
-                Command::Fields(schema, table, action) if action.is_empty() => Some((schema.clone(), table.clone())),
+                Command::Fields(schema, tables, action) if action.is_empty() => tables.first().map(|table| (schema.clone(), table.clone())),
                 _ => None,
             },
             fields_request: matches!(command, Command::Fields(_, _, action) if action != "completion"),
@@ -414,6 +417,43 @@ async fn guarded<T, E: From<&'static str>>(
         _ = tokio::time::sleep(Duration::from_secs(seconds)) => Err("TIMEOUT".into()),
         _ = async { loop { if cancelled.load(Ordering::Relaxed) { break; } tokio::time::sleep(Duration::from_millis(50)).await; } } => Err("CANCELLED".into()),
     }
+}
+
+fn query_archive_folder(custom: Option<&Path>) -> Result<PathBuf, String> {
+    match custom {
+        Some(path) => Ok(path.to_path_buf()),
+        None => std::env::current_exe().map(|exe| exe.with_file_name("query-history")).map_err(|e| e.to_string()),
+    }
+}
+
+fn archive_query(sql: &str, sets: &mut [ResultSet], custom_folder: Option<&Path>) -> Result<(), String> {
+    let mut time = windows_sys::Win32::Foundation::SYSTEMTIME::default();
+    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut time) };
+    let timestamp = format!("{:04}-{:02}-{:02}_{:02}-{:02}-{:02}.{:03}",
+        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond, time.wMilliseconds);
+    let root = query_archive_folder(custom_folder)?;
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let staging = tempfile::Builder::new().prefix(&format!(".{timestamp}_")).tempdir_in(&root).map_err(|e| e.to_string())?;
+    std::fs::write(staging.path().join("query.sql"), sql).map_err(|e| e.to_string())?;
+    let mut rowsets: Vec<_> = sets.iter().enumerate().filter(|(_, set)| !set.status)
+        .flat_map(|(index, set)| set.statements.iter().map(move |&statement| (statement, index)))
+        .collect();
+    rowsets.sort_unstable();
+    let mut written = std::collections::HashMap::new();
+    for (number, (_, index)) in rowsets.into_iter().enumerate() {
+        let path = staging.path().join(format!("result-{:03}.jsonl", number + 1));
+        match written.entry(index) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                sets[index].archive(&path)?;
+                entry.insert(path);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                std::fs::copy(entry.get(), path).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    let completed = staging.path().file_name().unwrap().to_str().unwrap().trim_start_matches('.');
+    std::fs::rename(staging.path(), root.join(completed)).map_err(|e| e.to_string())
 }
 
 impl Worker {
@@ -1009,7 +1049,7 @@ impl Worker {
     async fn handle(&mut self, mut command: Command) -> Result<String, String> {
         if matches!(
             &command,
-            Command::SaveProfile(..) | Command::DeleteProfile(..) | Command::Language(..) | Command::Theme(..) | Command::SaveTimeout(..) | Command::SaveScopes(..) | Command::SavePrefixes(..) | Command::SetObjectHidden(..)
+            Command::SaveProfile(..) | Command::DeleteProfile(..) | Command::Language(..) | Command::ToggleQueryArchive | Command::SetQueryArchiveFolder { .. } | Command::Theme(..) | Command::SaveTimeout(..) | Command::SaveScopes(..) | Command::SavePrefixes(..) | Command::SetObjectHidden(..)
         ) {
             if let Some(error) = &self.settings_error {
                 return Err(format!("{}\n{error}", self.message("原配置无法读取，已阻止覆盖。请修复配置文件后重启。", "Existing configuration could not be read; overwriting is blocked. Repair the file and restart.")));
@@ -1280,119 +1320,128 @@ impl Worker {
                 self.tables(&schema).await?;
                 Ok(self.message("已加载表与视图", "Tables and views loaded"))
             }
-            Command::Fields(schema, table, action) => {
-                let redshift = self
-                    .active
-                    .as_ref()
-                    .is_some_and(|(profile, _)| profile.redshift);
-                let sql = db::columns_sql(&schema, Some(&table), redshift);
-                // "All" entries are qualified display names resolved through the cached snapshot.
-                let located = if schema.is_empty() { self.all_index.get(&table).cloned() } else { None };
-                if schema.is_empty() && located.is_none() {
-                    return Err(self.message("未找到该对象的缓存字段，请刷新后重试", "Cached columns for this object were not found; refresh and retry"));
-                }
-                let cached = match &located {
-                    Some((profile, real_schema, real_table)) => Some(self.metadata_cache.schema_columns(profile, real_schema, real_table)
-                        .ok_or_else(|| self.message("未找到该对象的缓存字段，请刷新后重试", "Cached columns for this object were not found; refresh and retry"))?),
-                    None => self.active.as_ref().and_then(|(profile, _)| self.metadata_cache.schema_columns(profile, &schema, &table)),
-                };
-                let from_schema = cached.is_some() && located.is_none();
-                let cached = cached.or_else(|| self.active.as_ref().and_then(|(profile, _)| self.metadata_cache.get(profile, &sql)));
-                let mut rows = match cached {
-                    Some(rows) => rows,
-                    None => {
-                        if action != "completion" {
-                            let schema = schema.clone();
-                            let table = table.clone();
-                            let selection = action.is_empty();
-                            update(&self.ui, move |ui| {
-                                if ui.get_schema() == schema.as_str()
-                                    && (!selection || ui.get_tables().row_data(ui.get_table_index() as usize).is_some_and(|item| item.text == table.as_str())) {
-                                    loading_fields(&ui, &table);
-                                }
-                            });
-                        }
-                        self.metadata(&sql).await?
-                    }
-                };
-                let added = if located.is_some() { Vec::new() } else { self.active.as_ref().map(|(profile, _)| if from_schema { self.metadata_cache.changed_schema_columns(profile, &schema, &table, &rows) } else { self.metadata_cache.changed_columns(profile, &sql, &rows) }).unwrap_or_default() };
-                let objects = vec![DbObject { name: table.as_str().into(), kind: 0 }];
-                let table_changed = located.is_none() && self.active.as_ref().is_some_and(|(profile, _)| !self.metadata_cache.changed_tables(profile, &schema, &objects).is_empty());
-                for row in &mut rows {
-                    let bytes = row.get(4).and_then(|value| value.as_deref()).and_then(|value| value.parse::<i32>().ok()).filter(|value| *value > 0);
-                    if let Some(datatype) = &mut row[1] {
-                        let lower = datatype.to_ascii_lowercase();
-                        if lower == "timestamp" || lower == "timestamptz" || lower.starts_with("timestamp(") || lower.starts_with("timestamp ") {
-                            *datatype = "timestamp".into();
-                        } else if let Some(suffix) = datatype.strip_prefix("character varying").filter(|suffix| suffix.is_empty() || suffix.starts_with('(')) {
-                            *datatype = format!("varchar{suffix}");
-                        }
-                        if datatype != "timestamp" && !datatype.contains('(') {
-                            let name = if datatype == "integer" { "int" } else { datatype.as_str() };
-                            *datatype = match bytes {
-                                Some(bytes) => format!("{name}({bytes})"),
-                                None => format!("{name}(variable)"),
-                            };
-                        }
-                    }
-                    row.truncate(4);
-                }
+            Command::Fields(schema, tables, action) => {
                 let copy_structure = action == "copy-structure";
-                if copy_structure {
-                    let mut structure = ResultSet::new(vec![self.message("字段", "Column"), self.message("类型", "Type")])?;
-                    for row in &rows { structure.push(vec![row[0].clone(), row[1].clone()])?; }
-                    let cancelled = self.cancelled.clone();
-                    let text = format!("{table}\n{}", structure.clipboard(None, None, None, true, || cancelled.load(Ordering::Relaxed))?);
-                    arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)).map_err(|error| error.to_string())?;
+                let batch = tables.len() > 1;
+                let mut copied = Vec::new();
+                for table in tables {
+                    let redshift = self
+                        .active
+                        .as_ref()
+                        .is_some_and(|(profile, _)| profile.redshift);
+                    let sql = db::columns_sql(&schema, Some(&table), redshift);
+                    // "All" entries are qualified display names resolved through the cached snapshot.
+                    let located = if schema.is_empty() { self.all_index.get(&table).cloned() } else { None };
+                    if schema.is_empty() && located.is_none() {
+                        return Err(self.message("未找到该对象的缓存字段，请刷新后重试", "Cached columns for this object were not found; refresh and retry"));
+                    }
+                    let cached = match &located {
+                        Some((profile, real_schema, real_table)) => Some(self.metadata_cache.schema_columns(profile, real_schema, real_table)
+                            .ok_or_else(|| self.message("未找到该对象的缓存字段，请刷新后重试", "Cached columns for this object were not found; refresh and retry"))?),
+                        None => self.active.as_ref().and_then(|(profile, _)| self.metadata_cache.schema_columns(profile, &schema, &table)),
+                    };
+                    let from_schema = cached.is_some() && located.is_none();
+                    let cached = cached.or_else(|| self.active.as_ref().and_then(|(profile, _)| self.metadata_cache.get(profile, &sql)));
+                    let mut rows = match cached {
+                        Some(rows) => rows,
+                        None => {
+                            if action != "completion" && !batch {
+                                let schema = schema.clone();
+                                let table = table.clone();
+                                let selection = action.is_empty();
+                                update(&self.ui, move |ui| {
+                                    if ui.get_schema() == schema.as_str()
+                                        && (!selection || ui.get_tables().row_data(ui.get_table_index() as usize).is_some_and(|item| item.text == table.as_str())) {
+                                        loading_fields(&ui, &table);
+                                    }
+                                });
+                            }
+                            self.metadata(&sql).await?
+                        }
+                    };
+                    let added = if located.is_some() { Vec::new() } else { self.active.as_ref().map(|(profile, _)| if from_schema { self.metadata_cache.changed_schema_columns(profile, &schema, &table, &rows) } else { self.metadata_cache.changed_columns(profile, &sql, &rows) }).unwrap_or_default() };
+                    let objects = vec![DbObject { name: table.as_str().into(), kind: 0 }];
+                    let table_changed = located.is_none() && self.active.as_ref().is_some_and(|(profile, _)| !self.metadata_cache.changed_tables(profile, &schema, &objects).is_empty());
+                    for row in &mut rows {
+                        let bytes = row.get(4).and_then(|value| value.as_deref()).and_then(|value| value.parse::<i32>().ok()).filter(|value| *value > 0);
+                        if let Some(datatype) = &mut row[1] {
+                            let lower = datatype.to_ascii_lowercase();
+                            if lower == "timestamp" || lower == "timestamptz" || lower.starts_with("timestamp(") || lower.starts_with("timestamp ") {
+                                *datatype = "timestamp".into();
+                            } else if let Some(suffix) = datatype.strip_prefix("character varying").filter(|suffix| suffix.is_empty() || suffix.starts_with('(')) {
+                                *datatype = format!("varchar{suffix}");
+                            }
+                            if datatype != "timestamp" && !datatype.contains('(') {
+                                let name = if datatype == "integer" { "int" } else { datatype.as_str() };
+                                *datatype = match bytes {
+                                    Some(bytes) => format!("{name}({bytes})"),
+                                    None => format!("{name}(variable)"),
+                                };
+                            }
+                        }
+                        row.truncate(4);
+                    }
+                    if copy_structure {
+                        let mut structure = ResultSet::new(vec![self.message("字段", "Column"), self.message("类型", "Type")])?;
+                        for row in &rows { structure.push(vec![row[0].clone(), row[1].clone()])?; }
+                        let cancelled = self.cancelled.clone();
+                        copied.push(format!("{table}\n{}", structure.clipboard(None, None, None, true, || cancelled.load(Ordering::Relaxed))?));
+                        if batch { continue; }
+                    }
+                    let details: Vec<FieldRow> = rows.iter().enumerate().map(|(index, row)| FieldRow {
+                        name: row[0].as_deref().unwrap_or_default().into(),
+                        datatype: row[1].as_deref().unwrap_or_default().into(),
+                        added: added.get(index).copied().unwrap_or(false),
+                    }).collect();
+                    let field_names = rows
+                        .iter()
+                        .filter_map(|row| row[0].clone())
+                        .collect::<Vec<_>>();
+                    let fields = field_names.clone();
+                    let title = if schema.is_empty() { table.clone() } else { format!("{schema}.{table}") };
+                    let schema = schema.clone();
+                    let action = action.clone();
+                    update(&self.ui, move |ui| {
+                        use slint::Model;
+                        if ui.get_schema() != schema.as_str() { return; }
+                        let mut index: Vec<String> = ui.get_column_index().iter().map(|entry| entry.to_string()).filter(|entry| serde_json::from_str::<(String, Vec<String>)>(entry).is_ok_and(|(name, _)| name != table)).collect();
+                        index.push(serde_json::to_string(&(&table, &field_names)).unwrap());
+                        ui.set_column_index(strings(index));
+                        ui.set_completion_revision(ui.get_completion_revision() + 1);
+                        if action == "completion" { filter_objects(&ui); return; }
+                        if action.is_empty()
+                            && (ui.get_schema() != schema.as_str()
+                                || ui
+                                    .get_tables()
+                                    .row_data(ui.get_table_index() as usize)
+                                    .is_none_or(|item| item.text != table.as_str()))
+                        {
+                            return;
+                        }
+                        ui.set_fields_loading(false);
+                        ui.set_field_panel_hidden(false);
+                        ui.set_fields(items(fields));
+                        ui.set_field_details(std::rc::Rc::new(VecModel::from(details)).into());
+                        let mut changed: Vec<_> = ui.get_changed_tables().iter().map(|name| name.to_string()).collect();
+                        changed.retain(|name| name != &table);
+                        if table_changed { changed.push(table.clone()); }
+                        ui.set_changed_tables(strings(changed));
+                        filter_objects(&ui);
+                        ui.set_object_title(title.into());
+                        ui.set_object_name(table.into());
+                        ui.set_field_names(strings(field_names));
+                        if action == "quick-group" {
+                            ui.set_group_search("".into());
+                            ui.set_group_selected(ModelRc::default());
+                            ui.set_group_selected_index(-1);
+                            filter_group(&ui);
+                            ui.set_group_open(true);
+                        }
+                    });
                 }
-                let details: Vec<FieldRow> = rows.iter().enumerate().map(|(index, row)| FieldRow {
-                    name: row[0].as_deref().unwrap_or_default().into(),
-                    datatype: row[1].as_deref().unwrap_or_default().into(),
-                    added: added.get(index).copied().unwrap_or(false),
-                }).collect();
-                let field_names = rows
-                    .iter()
-                    .filter_map(|row| row[0].clone())
-                    .collect::<Vec<_>>();
-                let fields = field_names.clone();
-                let title = if schema.is_empty() { table.clone() } else { format!("{schema}.{table}") };
-                update(&self.ui, move |ui| {
-                    use slint::Model;
-                    if ui.get_schema() != schema.as_str() { return; }
-                    let mut index: Vec<String> = ui.get_column_index().iter().map(|entry| entry.to_string()).filter(|entry| serde_json::from_str::<(String, Vec<String>)>(entry).is_ok_and(|(name, _)| name != table)).collect();
-                    index.push(serde_json::to_string(&(&table, &field_names)).unwrap());
-                    ui.set_column_index(strings(index));
-                    ui.set_completion_revision(ui.get_completion_revision() + 1);
-                    if action == "completion" { filter_objects(&ui); return; }
-                    if action.is_empty()
-                        && (ui.get_schema() != schema.as_str()
-                            || ui
-                                .get_tables()
-                                .row_data(ui.get_table_index() as usize)
-                                .is_none_or(|item| item.text != table.as_str()))
-                    {
-                        return;
-                    }
-                    ui.set_fields_loading(false);
-                    ui.set_field_panel_hidden(false);
-                    ui.set_fields(items(fields));
-                    ui.set_field_details(std::rc::Rc::new(VecModel::from(details)).into());
-                    let mut changed: Vec<_> = ui.get_changed_tables().iter().map(|name| name.to_string()).collect();
-                    changed.retain(|name| name != &table);
-                    if table_changed { changed.push(table.clone()); }
-                    ui.set_changed_tables(strings(changed));
-                    filter_objects(&ui);
-                    ui.set_object_title(title.into());
-                    ui.set_object_name(table.into());
-                    ui.set_field_names(strings(field_names));
-                    if action == "quick-group" {
-                        ui.set_group_search("".into());
-                        ui.set_group_selected(ModelRc::default());
-                        ui.set_group_selected_index(-1);
-                        filter_group(&ui);
-                        ui.set_group_open(true);
-                    }
-                });
+                if copy_structure {
+                    arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(copied.join("\n\n"))).map_err(|error| error.to_string())?;
+                }
                 Ok(if copy_structure { self.message("已复制表结构", "Table structure copied") } else { self.message("已加载字段", "Columns loaded") })
             }
             Command::Run(sql, timeout) => {
@@ -1424,6 +1473,21 @@ impl Worker {
                         return Err(error.message);
                     }
                 };
+                if self.settings.archive_queries {
+                    let folder = self.settings.query_archive_folder.clone();
+                    let archived = tokio::task::spawn_blocking(move || {
+                        let result = archive_query(&sql, &mut sets, folder.as_deref());
+                        (sets, result)
+                    }).await.map_err(|e| e.to_string())?;
+                    sets = archived.0;
+                    if let Err(error) = archived.1 {
+                        update(&self.ui, move |ui| {
+                            let zh = ui.global::<I18n>().get_zh();
+                            let label = tr(zh, "查询归档失败", "Query archive failed");
+                            ui.invoke_notify(format!("{label}: {error}").into());
+                        });
+                    }
+                }
                 for set in &mut sets {
                     set.name = set.statements.iter().filter_map(|&statement| labels.get(statement).filter(|label| !label.is_empty())).cloned().collect::<Vec<_>>().join(" / ");
                 }
@@ -1714,6 +1778,48 @@ impl Worker {
                 if let Err(error) = config::save(&self.settings) { self.settings.query_timeout = old; return Err(error); }
                 update(&self.ui, move |ui| { ui.set_timeout((timeout / 60) as i32); ui.set_timeout_open(false); });
                 Ok(self.message("已保存", "Saved"))
+            }
+            Command::OpenQueryArchive => {
+                let path = query_archive_folder(self.settings.query_archive_folder.as_deref())?;
+                let enabled = self.settings.archive_queries;
+                update(&self.ui, move |ui| {
+                    ui.set_archive_queries(enabled);
+                    ui.set_archive_folder(path.to_string_lossy().as_ref().into());
+                    ui.set_history_settings_open(true);
+                });
+                Ok(String::new())
+            }
+            Command::ToggleQueryArchive => {
+                let enabled = !self.settings.archive_queries;
+                self.settings.archive_queries = enabled;
+                if let Err(error) = config::save(&self.settings) {
+                    self.settings.archive_queries = !enabled;
+                    return Err(error);
+                }
+                update(&self.ui, move |ui| ui.set_archive_queries(enabled));
+                Ok(String::new())
+            }
+            Command::SetQueryArchiveFolder { reset } => {
+                let folder = if reset {
+                    None
+                } else {
+                    let current = query_archive_folder(self.settings.query_archive_folder.as_deref())?;
+                    let mut dialog = rfd::FileDialog::new()
+                        .set_title(self.message("选择查询归档目录", "Choose query archive folder"));
+                    if let Some(start) = current.ancestors().find(|path| path.is_dir()) {
+                        dialog = dialog.set_directory(start);
+                    }
+                    let Some(folder) = dialog.pick_folder() else { return Ok(String::new()); };
+                    Some(folder)
+                };
+                let path = query_archive_folder(folder.as_deref())?;
+                let old = std::mem::replace(&mut self.settings.query_archive_folder, folder);
+                if let Err(error) = config::save(&self.settings) {
+                    self.settings.query_archive_folder = old;
+                    return Err(error);
+                }
+                update(&self.ui, move |ui| ui.set_archive_folder(path.to_string_lossy().as_ref().into()));
+                Ok(String::new())
             }
             Command::Language(zh) => {
                 self.settings.language = Some(if zh { "zh" } else { "en" }.into());
@@ -2314,6 +2420,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if matches!(action.as_str(), "copy-structure" | "quick-group" | "quick-limit" | "copy-table") {
             use slint::Model;
+            if action == "copy-structure" && ui.get_object_selection_count() > 1 {
+                let selection = ui.get_object_selection();
+                let tables = ui.get_tables().iter().enumerate()
+                    .filter(|(row, _)| selection.row_data(*row).unwrap_or(false))
+                    .map(|(_, item)| item.text.to_string()).collect();
+                submit(&ui, &sender, &cancel, Command::Fields(ui.get_schema().to_string(), tables, action.to_string()));
+                return;
+            }
             if let Some(table) = ui.get_tables().row_data(ui.get_table_index() as usize) {
                 if action == "copy-table" {
                     let result = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(table.text.to_string()));
@@ -2327,7 +2441,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if action == "quick-limit" {
                     ui.set_sql(format!("SELECT *\nFROM {}\nLIMIT 10;", table.text).into());
                 } else {
-                    submit(&ui, &sender, &cancel, Command::Fields(ui.get_schema().to_string(), table.text.to_string(), action.to_string()));
+                    submit(&ui, &sender, &cancel, Command::Fields(ui.get_schema().to_string(), vec![table.text.to_string()], action.to_string()));
                 }
             }
             return;
@@ -2336,6 +2450,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "save-timeout" => ui.get_timeout_input().trim().parse::<u64>().ok().filter(|timeout| (1..=3600).contains(timeout)).map(|minutes| Command::SaveTimeout(minutes * 60))
                 .ok_or_else(|| tr(ui.global::<I18n>().get_zh(), "请输入 1–3600 之间的整数分钟数", "Enter a whole number of minutes from 1 to 3600")),
             "scope-settings" => Ok(Command::OpenScopes),
+            "query-history-settings" => Ok(Command::OpenQueryArchive),
+            "toggle-query-archive" => Ok(Command::ToggleQueryArchive),
+            "choose-query-archive-folder" => Ok(Command::SetQueryArchiveFolder { reset: false }),
+            "reset-query-archive-folder" => Ok(Command::SetQueryArchiveFolder { reset: true }),
             "save-scopes" => {
                 use slint::Model;
                 Ok(Command::SaveScopes(ui.get_browser_scopes().iter().map(|scope| config::BrowserSelection {
@@ -2537,7 +2655,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut missing = None;
         let suggestions = completion::suggest(&sql, offset.max(0) as usize, &tables, &ui.get_schema(), &mut missing);
         if let Some(table) = missing.filter(|_| !ui.get_busy() && !ui.get_switching() && ui.get_connected()) {
-            submit(&ui, &completion_sender, &completion_cancel, Command::Fields(ui.get_schema().to_string(), table, "completion".into()));
+            submit(&ui, &completion_sender, &completion_cancel, Command::Fields(ui.get_schema().to_string(), vec![table], "completion".into()));
         }
         strings(suggestions)
     });
@@ -2690,7 +2808,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &cancel,
                     Command::Fields(
                         ui.get_schema().to_string(),
-                        table.text.to_string(),
+                        vec![table.text.to_string()],
                         String::new(),
                     ),
                 );

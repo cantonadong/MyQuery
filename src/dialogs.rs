@@ -36,9 +36,9 @@ pub(crate) fn notify_result(ui: &AppWindow, message: &str) -> Option<crate::Resu
     if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 { return None; }
     bubble.show().ok()?;
     unsafe {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TOOLWINDOW};
         let window = native_window("MyQuery SQL");
-        if !window.is_null() { SetWindowLongPtrW(window, GWL_EXSTYLE, GetWindowLongPtrW(window, GWL_EXSTYLE) | WS_EX_NOACTIVATE as isize | WS_EX_TOOLWINDOW as isize); }
+        if !window.is_null() { SetWindowLongPtrW(window, GWL_EXSTYLE, GetWindowLongPtrW(window, GWL_EXSTYLE) | WS_EX_TOOLWINDOW as isize); }
     }
     let size = bubble.window().size();
     let scale = ui.window().scale_factor();
@@ -59,8 +59,22 @@ pub(crate) fn notify_result(ui: &AppWindow, message: &str) -> Option<crate::Resu
         }
     }
     bubble.window().set_position(slint::PhysicalPosition::new(x, y.max(info.rcWork.top + margin)));
-    let weak = bubble.as_weak();
-    slint::Timer::single_shot(Duration::from_secs(5), move || { if let Some(bubble) = weak.upgrade() { let _ = bubble.hide(); } });
+    let weak = ui.as_weak();
+    bubble.on_activate(move || {
+        use windows_sys::Win32::UI::{
+            Input::KeyboardAndMouse::IsWindowEnabled,
+            WindowsAndMessaging::{GetLastActivePopup, IsIconic, ShowWindow, SW_RESTORE},
+        };
+        let Some(ui) = weak.upgrade() else { return; };
+        let owner = native_window(&ui.get_window_title());
+        if owner.is_null() { return; }
+        let activated = unsafe {
+            if IsIconic(owner) != 0 { ShowWindow(owner, SW_RESTORE); }
+            let target = if IsWindowEnabled(owner) != 0 { owner } else { GetLastActivePopup(owner) };
+            SetForegroundWindow(target) != 0
+        };
+        if activated { ui.invoke_dismiss_notification(); }
+    });
     Some(bubble)
 }
 
@@ -71,6 +85,7 @@ fn selected(ui: &AppWindow) -> i32 {
     else if ui.get_scopes_open() { 2 }
     else if ui.get_timeout_open() { 3 }
     else if ui.get_group_open() { 6 }
+    else if ui.get_history_settings_open() { 7 }
     else { 0 }
 }
 
@@ -78,7 +93,8 @@ fn close(ui: &AppWindow, mode: i32) {
     match mode {
         1 => ui.set_config_open(false), 2 => ui.set_scopes_open(false),
         3 => ui.set_timeout_open(false), 4 => ui.set_rename_sql_open(false),
-        5 => ui.invoke_action("prompt-cancel".into()), 6 => ui.set_group_open(false), _ => {}
+        5 => ui.invoke_action("prompt-cancel".into()), 6 => ui.set_group_open(false),
+        7 => ui.set_history_settings_open(false), _ => {}
     }
 }
 
@@ -107,6 +123,7 @@ fn edits_to_main(dialog: &DialogWindow, ui: &AppWindow) {
     ui.set_rename_sql_open(dialog.get_rename_sql_open());
     ui.set_save_prompt_open(dialog.get_save_prompt_open());
     ui.set_group_open(dialog.get_group_open());
+    ui.set_history_settings_open(dialog.get_history_settings_open());
 }
 
 fn refresh(ui: &AppWindow, dialog: &DialogWindow) {
@@ -135,6 +152,9 @@ fn refresh(ui: &AppWindow, dialog: &DialogWindow) {
     dialog.set_rename_sql_open(ui.get_rename_sql_open());
     dialog.set_save_prompt_open(ui.get_save_prompt_open());
     dialog.set_group_open(ui.get_group_open());
+    dialog.set_history_settings_open(ui.get_history_settings_open());
+    dialog.set_archive_queries(ui.get_archive_queries());
+    dialog.set_archive_folder(ui.get_archive_folder());
     dialog.set_busy(ui.get_busy() || ui.get_switching() || (ui.get_queries_running() && (ui.get_config_open() || ui.get_scopes_open())));
     dialog.set_document_saving(ui.get_document_saving());
     dialog.set_profiles(ui.get_profiles());
@@ -227,6 +247,16 @@ pub fn bind(ui: &AppWindow) -> slint::Timer {
                 }
                 slint::CloseRequestResponse::KeepWindowShown
             });
+            let parent = ui.as_weak();
+            {
+                use slint::winit_030::{EventResult, WinitWindowAccessor, winit::event::WindowEvent};
+                dialog.window().on_winit_window_event(move |_, event| {
+                    if matches!(event, WindowEvent::Focused(true)) {
+                        if let Some(ui) = parent.upgrade() { ui.invoke_dismiss_notification(); }
+                    }
+                    EventResult::Propagate
+                });
+            }
             if let Err(error) = dialog.show() { close(&ui, mode); ui.set_failed(true); ui.set_status(error.to_string().into()); return; }
             let parent = ui.as_weak();
             let child = dialog.as_weak();

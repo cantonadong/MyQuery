@@ -327,6 +327,9 @@ export component AppWindow inherits Window {
     callback change-page(int);
     callback language-changed();
     callback theme-selected(bool);
+    in property <bool> archive-queries;
+    in property <string> archive-folder;
+    in-out property <bool> history-settings-open;
 
 
     in-out property <bool> light-checked: true;
@@ -374,6 +377,7 @@ export component AppWindow inherits Window {
                             MenuItem { title: I18n.t("连接配置…", "Connections…"); enabled: !root.browser-busy; activated => { root.config-open = true; root.timeout-open = false; root.group-open = false; } }
                             MenuItem { title: I18n.t("浏览范围…", "Browsing scope…"); enabled: !root.browser-busy; activated => { root.action("scope-settings"); } }
                             MenuItem { title: I18n.t("查询超时…", "Query timeout…"); enabled: !root.browser-busy; activated => { root.timeout-input = root.timeout; root.timeout-open = true; root.config-open = false; root.group-open = false; } }
+                            MenuItem { title: I18n.t("历史记录…", "Query history…"); enabled: !root.browser-busy; activated => { root.action("query-history-settings"); } }
                             Menu {
                                 title: I18n.t("主题", "Theme"); enabled: !root.browser-busy;
                                 MenuItem { title: I18n.t("浅色（Light）", "Light"); checkable: true; checked <=> root.light-checked; enabled: !root.browser-busy; activated => { root.theme-selected(false); root.sync-theme-menu(); } }
@@ -440,7 +444,8 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
                     min-height: 100px;
                     actions: root.object-selection-count > 1 ? [
-                        { text: I18n.t("复制", "Copy"), enabled: true, checked: false, icon: @image-url("icons/copy.svg") }
+                        { text: I18n.t("复制", "Copy"), enabled: true, checked: false, icon: @image-url("icons/copy.svg") },
+                        { text: I18n.t("复制表结构", "Copy table structure"), enabled: !root.browser-busy, checked: false, icon: @image-url("icons/table-structure.svg") }
                     ] : [
                         { text: I18n.t("复制表名", "Copy object name"), enabled: !root.browser-busy && root.table-index >= 0, checked: false, icon: @image-url("icons/copy.svg") },
                         { text: I18n.t("复制表结构", "Copy table structure"), enabled: !root.browser-busy && root.table-index >= 0, checked: false, icon: @image-url("icons/table-structure.svg") },
@@ -907,7 +912,7 @@ export component AppWindow inherits Window {
         }
     }
     }
-    if (root.config-open || root.scopes-open || root.timeout-open || root.rename-sql-open || root.save-prompt-open || root.group-open): Rectangle {
+    if (root.config-open || root.scopes-open || root.timeout-open || root.rename-sql-open || root.save-prompt-open || root.group-open || root.history-settings-open): Rectangle {
         background: #60000000; TouchArea {}
     }
     if root.toast-age < 3000: Rectangle {
@@ -930,11 +935,11 @@ export component DialogWindow inherits Window {
     callback filter-options([string], string) -> [int];
     init => { Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light; }
     in-out property <int> dialog-mode: 1;
-    out property <string> window-title: root.dialog-mode == 1 ? I18n.t("连接配置", "Connections") : root.dialog-mode == 2 ? I18n.t("浏览范围", "Browsing scope") : root.dialog-mode == 3 ? I18n.t("查询超时", "Query timeout") : root.dialog-mode == 4 ? I18n.t("重命名", "Rename") : root.dialog-mode == 5 ? I18n.t("保存修改", "Save changes") + " · " + root.save-prompt-title : root.dialog-mode == 6 ? root.object-title : "MyQuery";
+    out property <string> window-title: root.dialog-mode == 1 ? I18n.t("连接配置", "Connections") : root.dialog-mode == 2 ? I18n.t("浏览范围", "Browsing scope") : root.dialog-mode == 3 ? I18n.t("查询超时", "Query timeout") : root.dialog-mode == 4 ? I18n.t("重命名", "Rename") : root.dialog-mode == 5 ? I18n.t("保存修改", "Save changes") + " · " + root.save-prompt-title : root.dialog-mode == 6 ? root.object-title : root.dialog-mode == 7 ? I18n.t("历史记录", "Query history") : "MyQuery";
     title: root.window-title;
     icon: @image-url("icons/app.png");
-    preferred-width: root.dialog-mode == 0 ? 1280px : root.dialog-mode == 1 ? 640px : root.dialog-mode == 2 ? 460px : root.dialog-mode == 3 ? 340px : root.dialog-mode == 6 ? 480px : 420px;
-    preferred-height: root.dialog-mode == 0 ? 850px : root.dialog-mode == 1 ? 496px : root.dialog-mode == 2 ? 256px + max(28px, root.scope-page-count * 28px) + (root.scope-pages > 1 ? 34px : 0px) : root.dialog-mode == 3 ? 100px : root.dialog-mode == 6 ? 220px + min(176px, max(66px, root.group-selected.length * 22px)) + min(220px, max(66px, root.group-fields.length * 22px)) : 100px;
+    preferred-width: root.dialog-mode == 0 ? 1280px : root.dialog-mode == 1 ? 640px : root.dialog-mode == 2 ? 460px : root.dialog-mode == 3 ? 340px : root.dialog-mode == 6 ? 480px : root.dialog-mode == 7 ? 520px : 420px;
+    preferred-height: root.dialog-mode == 0 ? 850px : root.dialog-mode == 1 ? 496px : root.dialog-mode == 2 ? 256px + max(28px, root.scope-page-count * 28px) + (root.scope-pages > 1 ? 34px : 0px) : root.dialog-mode == 3 ? 100px : root.dialog-mode == 6 ? 220px + min(176px, max(66px, root.group-selected.length * 22px)) + min(220px, max(66px, root.group-fields.length * 22px)) : root.dialog-mode == 7 ? (root.failed ? 180px : 140px) : 100px;
     min-width: root.dialog-mode == 0 ? 1050px : root.preferred-width;
     max-width: root.dialog-mode == 0 ? 100000px : root.preferred-width;
     min-height: root.dialog-mode == 0 ? 740px : root.preferred-height;
@@ -968,6 +973,9 @@ export component DialogWindow inherits Window {
     in-out property <bool> rename-sql-open;
     in-out property <bool> save-prompt-open;
     in-out property <bool> group-open;
+    in-out property <bool> history-settings-open;
+    in-out property <bool> archive-queries;
+    in property <string> archive-folder;
     in-out property <bool> busy;
     in-out property <bool> document-saving;
     in-out property <[string]> profiles;
@@ -1011,6 +1019,7 @@ export component DialogWindow inherits Window {
             else if root.dialog-mode == 4 { root.rename-sql-open = false; }
             else if root.dialog-mode == 5 { root.action("prompt-cancel"); return accept; }
             else if root.dialog-mode == 6 { root.group-open = false; }
+            else if root.dialog-mode == 7 { root.history-settings-open = false; }
             root.dialog-edited();
             return accept;
         }
@@ -1180,6 +1189,20 @@ export component DialogWindow inherits Window {
                 }
             }
     }
+    if root.dialog-mode == 7: VerticalBox {
+        padding: 16px; spacing: 10px;
+        CheckBox { height: 24px; text: I18n.t("保存成功执行的 SQL 和结果", "Save successful SQL and results"); checked <=> root.archive-queries; enabled: !root.busy; toggled => { root.action("toggle-query-archive"); } }
+        HorizontalBox { height: 32px; padding: 0px; spacing: Theme.control-gap;
+            Caption { text: I18n.t("存储位置", "Storage location"); }
+            LineEdit { text: root.archive-folder; read-only: true; horizontal-stretch: 1; accessible-label: I18n.t("存储位置", "Storage location"); }
+            CompactButton { text: I18n.t("选择目录…", "Choose folder…"); enabled: !root.busy; clicked => { root.action("choose-query-archive-folder"); } }
+        }
+        if root.failed: Text { height: 30px; text: root.status; color: Theme.text; wrap: word-wrap; overflow: elide; }
+        HorizontalBox { height: 24px; padding: 0px; spacing: Theme.control-gap; alignment: end;
+            CompactButton { text: I18n.t("恢复默认位置", "Restore default location"); enabled: !root.busy; clicked => { root.action("reset-query-archive-folder"); } }
+            CompactButton { text: I18n.t("关闭", "Close"); clicked => { root.history-settings-open = false; root.dialog-edited(); } }
+        }
+    }
     if root.toast-age < 3000: Rectangle {
         x: (root.width - self.width) / 2; y: root.height - 100px;
         width: min(root.width - 80px, toast-label.preferred-width + 32px); height: 38px;
@@ -1198,12 +1221,14 @@ export component ResultNotification inherits Window {
     width: 380px; height: 88px;
     background: transparent;
     in property <string> message;
-    private property <int> age;
-    Timer { interval: 50ms; running: root.age < 5000; triggered => { root.age += 50; } }
+    callback activate();
     Rectangle {
         width: 100%; height: 100%;
         background: Theme.panel; border-radius: Theme.control-radius; border-width: 1px; border-color: Theme.border;
-        opacity: max(0, 1 - root.age / 5000);
+        accessible-role: button;
+        accessible-label: root.message;
+        accessible-action-default => { root.activate(); }
         Text { x: 16px; y: 12px; width: parent.width - 32px; height: parent.height - 24px; text: root.message; color: Theme.text; font-family: "Microsoft YaHei UI"; font-size: 12px; wrap: word-wrap; vertical-alignment: center; }
+        TouchArea { mouse-cursor: pointer; clicked => { root.activate(); } }
     }
 }

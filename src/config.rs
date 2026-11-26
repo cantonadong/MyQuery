@@ -33,6 +33,10 @@ pub struct Settings {
     #[serde(default)]
     pub query_timeout: Option<u64>,
     #[serde(default)]
+    pub archive_queries: bool,
+    #[serde(default)]
+    pub query_archive_folder: Option<PathBuf>,
+    #[serde(default)]
     pub last_selection: Option<BrowserSelection>,
     #[serde(default)]
     pub browser_scopes: Vec<BrowserSelection>,
