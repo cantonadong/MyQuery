@@ -6,6 +6,7 @@
 - Keep all interface elements visually consistent: reuse the existing palette, typography, control sizes, borders, corner radii, spacing, and hover, focus, and disabled states. This includes chart-rendered controls such as legend reset buttons.
 - All new and changed interface text must support Simplified Chinese and English through the shared localization module. The default language follows the browser; users may select Simplified Chinese or English in Settings. Do not translate user-provided data, field names, or report titles.
 - Follow the user's global working rules: work directly on main and do not run tests unless explicitly requested.
+- After making changes, proactively rebuild and restart MyQuery so the running app reflects the current code.
 - Numeric formats are display settings only: integer, decimal, and percentage must preserve the original source values and calculation precision. Decimal display and the default decimal setting allow 1–4 decimal places; integer display uses 0.
 - UI terminology: the second sidebar is the toolbar; the right sidebar is the properties sidebar. Filter controls are added from the toolbar, appear on the canvas, and are configured in the properties sidebar after selection.
 - Filtering is controlled exclusively through toolbar-added canvas filters. Do not expose per-chart filter modes or apply legacy hidden filter conditions.

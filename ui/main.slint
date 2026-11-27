@@ -580,6 +580,7 @@ export component AppWindow inherits Window {
                 side-touch := TouchArea {
                     mouse-cursor: ew-resize;
                     clicked => { side-focus.focus(); }
+                    double-clicked => { root.sidebar-width = 330px; }
                     moved => { if self.pressed { root.sidebar-width = (sidebar.width + self.mouse-x - self.pressed-x).clamp(310px, min(650px, root.width - 680px)); } }
                 }
             }
